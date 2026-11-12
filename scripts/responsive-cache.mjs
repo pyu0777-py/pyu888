@@ -114,6 +114,19 @@ async function checkVariants(sourcePath, metadata) {
 }
 
 async function run() {
+  const isCloudflareBuild = Boolean(
+    process.env.CF_PAGES ||
+    process.env.CLOUDFLARE_PAGES ||
+    process.env.CF_PAGES_BRANCH ||
+    process.env.CF_PAGES_COMMIT_SHA ||
+    process.env.CF_WORKER
+  );
+
+  if (isCloudflareBuild) {
+    console.log('[responsive] Skipped because the build is running in Cloudflare Pages/Workers.');
+    return;
+  }
+
   const mode = process.argv.includes('--check-only')
     ? 'check-only'
     : process.argv.includes('--generate-only')

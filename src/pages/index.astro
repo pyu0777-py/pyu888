@@ -1982,12 +1982,41 @@ function getCatalogImageAttrs(src: string, sizes: string, loading: 'lazy' | 'eag
         function attachWaterfallImageListeners() {
             const grid = document.getElementById('waterfallGrid');
             if (!grid) return;
+
             grid.querySelectorAll<HTMLImageElement>('img').forEach((img) => {
                 if (!img.complete && !img.dataset.wfL) {
                     img.dataset.wfL = '1';
                     img.addEventListener('load',  scheduleWaterfallLayout, { once: true });
                     img.addEventListener('error', scheduleWaterfallLayout, { once: true });
                 }
+            });
+
+            grid.querySelectorAll<HTMLElement>('.waterfall-block').forEach((block) => {
+                if (block.dataset.wfPreviewBound === '1') return;
+                block.dataset.wfPreviewBound = '1';
+                block.addEventListener('click', () => {
+                    const mediaNode = block.querySelector<HTMLImageElement | HTMLVideoElement>('img, video');
+                    if (!mediaNode) return;
+
+                    const mediaType = mediaNode instanceof HTMLVideoElement ? 'video' : 'image';
+                    const mediaSrc = mediaNode instanceof HTMLVideoElement
+                        ? (mediaNode.currentSrc || mediaNode.querySelector('source')?.getAttribute('src') || '')
+                        : mediaNode.currentSrc || mediaNode.src;
+
+                    if (!mediaSrc) return;
+
+                    const isSameItemOpen = overlay?.classList.contains('active') &&
+                        currentLightboxMedia.length === 1 &&
+                        currentLightboxMedia[0].type === mediaType &&
+                        currentLightboxMedia[0].src === mediaSrc;
+
+                    if (isSameItemOpen) {
+                        closeLightbox();
+                        return;
+                    }
+
+                    openLightbox([{ type: mediaType, src: mediaSrc }], 0);
+                });
             });
         }
 
