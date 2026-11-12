@@ -12,7 +12,8 @@
     "preview": "astro preview",
     "astro": "astro",
     "responsive:generate": "node scripts/responsive-cache.mjs --generate-only",
-    "responsive:check": "node scripts/responsive-cache.mjs --check-only"
+    "responsive:check": "node scripts/responsive-cache.mjs --check-only",
+    "optimize:public": "node scripts/optimize-public-assets.mjs"
   },
   "dependencies": {
     "astro": "^7.0.6",
@@ -20,6 +21,7 @@
   },
   "devDependencies": {
     "@types/node": "^26.1.1",
+    "ffmpeg-static": "^5.3.0",
     "wrangler": "^3.0.0"
   }
 }
