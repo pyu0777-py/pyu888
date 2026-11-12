@@ -1,0 +1,3059 @@
+---
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import sharp from 'sharp';
+
+type MainProjectCard = {
+    folderName: string;
+    coverSrc: string;
+    images: string[];
+    videos: string[];
+    previewVideoSrc?: string;
+    previewVideoMime?: string;
+    imageCount: number;
+    sortTime: number;
+};
+
+type WaterfallImage = {
+    type: 'image' | 'video';
+    src: string;
+    alt: string;
+    folderLabel: string;
+    mimeType?: string;
+};
+
+type ResponsiveImageData = {
+    src: string;
+    srcset?: string;
+    width?: number;
+    height?: number;
+};
+
+const publicRoot = path.resolve(process.cwd(), 'public');
+const mainProjectsRoot = path.join(publicRoot, '2c', '2y');
+const aplusProjectsRoot = path.join(publicRoot, '2c', '3q');
+const socialProjectsRoot = path.join(publicRoot, '2c', '4s');
+const brandProjectsRoot = path.join(publicRoot, '2c', '5p');
+const packagingProjectsRoot = path.join(publicRoot, '2c', '6b');
+const cesProjectsRoot = path.join(publicRoot, '2c', '7x');
+const otherProjectsRoot = path.join(publicRoot, '2c', '8q');
+const waterfallRoot = path.join(publicRoot, '2c', '1p');
+const responsiveOutputRoot = path.join(publicRoot, '__responsive');
+const imageExtensions = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.avif']);
+const videoExtensions = new Set(['.mp4', '.webm', '.mov']);
+const responsiveVariantWidths = [240, 360, 480, 640, 960, 1280];
+const responsiveImageCache = new Map<string, Promise<ResponsiveImageData>>();
+const isDev = import.meta.env.DEV;
+
+const imageSizes = {
+    waterfall: '(max-width: 480px) 50vw, (max-width: 768px) 33vw, (max-width: 1200px) 20vw, 280px',
+    card: '(max-width: 480px) 50vw, (max-width: 768px) 33vw, (max-width: 1200px) 25vw, 280px',
+    heroBadge: '80px',
+    methodology: '(max-width: 480px) 100vw, (max-width: 992px) 92vw, 1100px',
+    avatar: '96px',
+    lightbox: '100vw',
+};
+
+function toPublicUrl(absolutePath: string) {
+    return encodeURI('/' + path.relative(publicRoot, absolutePath).split(path.sep).join('/'));
+}
+
+function isRemoteImageUrl(src: string) {
+    return /^https?:\/\//i.test(src);
+}
+
+function isLocalPublicImageUrl(src: string) {
+    return src.startsWith('/') && !src.startsWith('//');
+}
+
+function normalizePublicUrl(src: string) {
+    if (!src.startsWith('/')) return src;
+    return encodeURI(decodeURI(src));
+}
+
+function getAbsolutePathFromPublicUrl(src: string) {
+    return path.join(publicRoot, decodeURI(src.replace(/^\//, '')));
+}
+
+function getPublicUrlExtension(src: string) {
+    try {
+        return path.extname(decodeURI(src)).toLowerCase();
+    } catch {
+        return path.extname(src).toLowerCase();
+    }
+}
+
+async function fileExists(targetPath: string) {
+    try {
+        await fs.access(targetPath);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function getResponsiveVariantUrl(src: string, width: number, extension: string) {
+    const relativePath = decodeURI(src.replace(/^\//, ''));
+    const parsed = path.parse(relativePath);
+    const variantRelativePath = path.join('__responsive', parsed.dir, `${parsed.name}-w${width}${extension}`);
+    return encodeURI('/' + variantRelativePath.split(path.sep).join('/'));
+}
+
+function getSharpFormat(extension: string) {
+    const normalized = extension.toLowerCase();
+    if (normalized === '.jpg' || normalized === '.jpeg') return 'jpeg';
+    if (normalized === '.png') return 'png';
+    if (normalized === '.webp') return 'webp';
+    if (normalized === '.avif') return 'avif';
+    return null;
+}
+
+async function createLocalResponsiveImageData(src: string): Promise<ResponsiveImageData> {
+    const normalizedSrc = normalizePublicUrl(src);
+    const absolutePath = getAbsolutePathFromPublicUrl(normalizedSrc);
+    let metadata;
+    try {
+        metadata = await sharp(absolutePath).metadata();
+    } catch (error) {
+        console.warn(`[responsive] skip unsupported image: ${normalizedSrc}`, error);
+        return { src: normalizedSrc };
+    }
+
+    if (!metadata.width || !metadata.height) {
+        return { src: normalizedSrc };
+    }
+
+    const extension = path.extname(absolutePath).toLowerCase();
+    if (extension === '.png' && Number(metadata.pages || 1) > 1) {
+        return {
+            src: normalizedSrc,
+            width: metadata.width,
+            height: metadata.height,
+        };
+    }
+
+    const sharpFormat = getSharpFormat(extension);
+
+    if (!sharpFormat || extension === '.gif') {
+        return {
+            src: normalizedSrc,
+            width: metadata.width,
+            height: metadata.height,
+        };
+    }
+
+    const candidateWidths = responsiveVariantWidths.filter((width) => width < metadata.width);
+    const parsed = path.parse(getAbsolutePathFromPublicUrl(normalizedSrc));
+    const variantDir = path.join(responsiveOutputRoot, path.relative(publicRoot, parsed.dir));
+    await fs.mkdir(variantDir, { recursive: true });
+
+    const generatedEntries = await Promise.all(
+        candidateWidths.map(async (width) => {
+            const outputPath = path.join(variantDir, `${parsed.name}-w${width}${extension}`);
+            if (!(await fileExists(outputPath))) {
+                let pipeline = sharp(absolutePath).rotate().resize({ width, withoutEnlargement: true });
+                if (sharpFormat === 'jpeg') pipeline = pipeline.jpeg({ quality: 82, mozjpeg: true });
+                if (sharpFormat === 'png') pipeline = pipeline.png({ compressionLevel: 9, palette: true });
+                if (sharpFormat === 'webp') pipeline = pipeline.webp({ quality: 82 });
+                if (sharpFormat === 'avif') pipeline = pipeline.avif({ quality: 60 });
+                await pipeline.toFile(outputPath);
+            }
+
+            return `${getResponsiveVariantUrl(normalizedSrc, width, extension)} ${width}w`;
+        })
+    );
+
+    const srcsetEntries = [...generatedEntries, `${normalizedSrc} ${metadata.width}w`];
+
+    return {
+        src: normalizedSrc,
+        srcset: srcsetEntries.join(', '),
+        width: metadata.width,
+        height: metadata.height,
+    };
+}
+
+function buildUnsplashResponsiveData(src: string): ResponsiveImageData {
+    const url = new URL(src);
+    const originalWidth = Number(url.searchParams.get('w') || '1600');
+    const widths = responsiveVariantWidths.filter((width) => width < originalWidth);
+    const srcset = [...widths, originalWidth]
+        .map((width) => {
+            const variant = new URL(url.toString());
+            variant.searchParams.set('w', String(width));
+            return `${variant.toString()} ${width}w`;
+        })
+        .join(', ');
+    return { src, srcset, width: originalWidth };
+}
+
+function buildPlaceholdResponsiveData(src: string): ResponsiveImageData {
+    const url = new URL(src);
+    const match = url.pathname.match(/\/(\d+)x(\d+)(?=\/|$)/i);
+    if (!match) return { src };
+
+    const originalWidth = Number(match[1]);
+    const originalHeight = Number(match[2]);
+    const widths = responsiveVariantWidths.filter((width) => width < originalWidth);
+    const srcset = [...widths, originalWidth]
+        .map((width) => {
+            const height = Math.round((originalHeight / originalWidth) * width);
+            return `${src.replace(`/${originalWidth}x${originalHeight}/`, `/${width}x${height}/`)} ${width}w`;
+        })
+        .join(', ');
+
+    return {
+        src,
+        srcset,
+        width: originalWidth,
+        height: originalHeight,
+    };
+}
+
+async function getResponsiveImageData(src: string): Promise<ResponsiveImageData> {
+    if (!src) return { src };
+
+    if (isLocalPublicImageUrl(src)) {
+        if (isDev) {
+            return { src: normalizePublicUrl(src) };
+        }
+        const ext = getPublicUrlExtension(src);
+        if (!imageExtensions.has(ext)) {
+            return { src };
+        }
+    }
+
+    if (!responsiveImageCache.has(src)) {
+        responsiveImageCache.set(
+            src,
+            (async () => {
+                if (isLocalPublicImageUrl(src)) {
+                    return createLocalResponsiveImageData(src);
+                }
+
+                if (/^https?:\/\/images\.unsplash\.com\//i.test(src)) {
+                    return buildUnsplashResponsiveData(src);
+                }
+
+                if (/^https?:\/\/placehold\.co\//i.test(src)) {
+                    return buildPlaceholdResponsiveData(src);
+                }
+
+                return { src };
+            })()
+        );
+    }
+
+    return responsiveImageCache.get(src)!;
+}
+
+function responsiveImgAttrs(data: ResponsiveImageData | undefined, sizes: string, loading: 'lazy' | 'eager' = 'lazy') {
+    if (!data) return { sizes, loading, decoding: 'async' as const };
+    return {
+        src: data.src,
+        srcset: data.srcset,
+        sizes,
+        width: data.width,
+        height: data.height,
+        loading,
+        decoding: 'async' as const,
+    };
+}
+
+function getVideoMimeType(fileName: string) {
+    const ext = path.extname(fileName).toLowerCase();
+    if (ext === '.webm') return 'video/webm';
+    if (ext === '.mov') return 'video/quicktime';
+    return 'video/mp4';
+}
+
+async function loadProjectCards(rootPath: string): Promise<MainProjectCard[]> {
+    const monthEntries = await fs.readdir(rootPath, { withFileTypes: true });
+    const projectFolders: Array<{ folderName: string; folderPath: string }> = [];
+
+    for (const monthEntry of monthEntries) {
+        if (!monthEntry.isDirectory()) continue;
+
+        const monthPath = path.join(rootPath, monthEntry.name);
+        const folderEntries = await fs.readdir(monthPath, { withFileTypes: true });
+
+        for (const folderEntry of folderEntries) {
+            if (!folderEntry.isDirectory()) continue;
+            projectFolders.push({
+                folderName: folderEntry.name,
+                folderPath: path.join(monthPath, folderEntry.name),
+            });
+        }
+    }
+
+    // Fallback: some categories use one-level folders directly under root.
+    if (!projectFolders.length) {
+        for (const entry of monthEntries) {
+            if (!entry.isDirectory()) continue;
+            const folderPath = path.join(rootPath, entry.name);
+            const childEntries = await fs.readdir(folderPath, { withFileTypes: true });
+            const hasSupportedMediaFiles = childEntries.some(
+                (child) =>
+                    child.isFile() &&
+                    (imageExtensions.has(path.extname(child.name).toLowerCase()) || videoExtensions.has(path.extname(child.name).toLowerCase()))
+            );
+            if (!hasSupportedMediaFiles) continue;
+            projectFolders.push({
+                folderName: entry.name,
+                folderPath,
+            });
+        }
+    }
+
+    const projectCards = await Promise.all(
+        projectFolders.map(async ({ folderName, folderPath }): Promise<MainProjectCard | null> => {
+            const fileEntries = await fs.readdir(folderPath, { withFileTypes: true });
+            const fileNames = fileEntries
+                .filter((entry) => entry.isFile())
+                .map((entry) => entry.name)
+                .sort((left, right) => left.localeCompare(right, 'zh-Hans-CN', { numeric: true, sensitivity: 'base' }))
+            const images = fileNames
+                .filter((fileName) => imageExtensions.has(path.extname(fileName).toLowerCase()))
+                .map((fileName) => toPublicUrl(path.join(folderPath, fileName)));
+            const videoFileNames = fileNames.filter((fileName) => videoExtensions.has(path.extname(fileName).toLowerCase()));
+            const videos = videoFileNames.map((fileName) => toPublicUrl(path.join(folderPath, fileName)));
+            const previewVideoFileName = videoFileNames[0];
+            const previewVideoSrc = previewVideoFileName ? toPublicUrl(path.join(folderPath, previewVideoFileName)) : undefined;
+            const previewVideoMime = previewVideoFileName ? getVideoMimeType(previewVideoFileName) : undefined;
+            
+            // Look for a file named "0" (with any image extension) as cover, otherwise use the first image
+            const coverImageFileName = fileNames.find((fileName) => path.parse(fileName).name === '0' && imageExtensions.has(path.extname(fileName).toLowerCase()));
+            const coverSrc = coverImageFileName ? toPublicUrl(path.join(folderPath, coverImageFileName)) : (images[0] ?? previewVideoSrc);
+
+            if (!coverSrc) return null;
+
+            const card: MainProjectCard = {
+                folderName,
+                coverSrc,
+                images,
+                videos,
+                imageCount: images.length,
+                sortTime: (await fs.stat(folderPath)).mtimeMs,
+            };
+
+            if (previewVideoSrc) {
+                card.previewVideoSrc = previewVideoSrc;
+                card.previewVideoMime = previewVideoMime;
+            }
+
+            return card;
+        })
+    );
+
+    return projectCards
+        .filter((card): card is MainProjectCard => Boolean(card))
+        .sort((left, right) => right.sortTime - left.sortTime || left.folderName.localeCompare(right.folderName, 'zh-Hans-CN', { numeric: true, sensitivity: 'base' }));
+}
+
+async function loadWaterfallImages(rootPath: string): Promise<WaterfallImage[]> {
+    const mediaItems: WaterfallImage[] = [];
+
+    async function walkDirectory(currentPath: string, folderTrail: string[] = []) {
+        const entries = await fs.readdir(currentPath, { withFileTypes: true });
+
+        for (const entry of entries) {
+            const entryPath = path.join(currentPath, entry.name);
+            if (entry.isDirectory()) {
+                await walkDirectory(entryPath, [...folderTrail, entry.name]);
+                continue;
+            }
+
+            if (!entry.isFile()) continue;
+            const extension = path.extname(entry.name).toLowerCase();
+            const isImage = imageExtensions.has(extension);
+            const isVideo = videoExtensions.has(extension);
+            if (!isImage && !isVideo) continue;
+
+            const folderLabel = folderTrail.length ? folderTrail.join(' / ') : path.basename(rootPath);
+            mediaItems.push({
+                type: isVideo ? 'video' : 'image',
+                src: toPublicUrl(entryPath),
+                alt: `${folderLabel} - ${entry.name}`,
+                folderLabel,
+                mimeType: isVideo ? getVideoMimeType(entry.name) : undefined,
+            });
+        }
+    }
+
+    await walkDirectory(rootPath);
+
+    return mediaItems.sort((left, right) => left.alt.localeCompare(right.alt, 'zh-Hans-CN', { numeric: true, sensitivity: 'base' }));
+}
+
+const mainProjectCards = await loadProjectCards(mainProjectsRoot);
+const aplusProjectCards = await loadProjectCards(aplusProjectsRoot);
+const socialProjectCards = await loadProjectCards(socialProjectsRoot);
+const brandProjectCards = await loadProjectCards(brandProjectsRoot);
+const packagingProjectCards = await loadProjectCards(packagingProjectsRoot);
+const cesProjectCards = await loadProjectCards(cesProjectsRoot);
+const otherProjectCards = await loadProjectCards(otherProjectsRoot);
+const waterfallImages = await loadWaterfallImages(waterfallRoot);
+const h5cDrone2RankImages = mainProjectCards.find((card) => card.folderName === 'H5C Drone 2')?.images ?? [];
+const a15hDroneRankImages = mainProjectCards.find((card) => card.folderName === 'A15H Drone')?.images ?? [];
+const h823hBlueRankImages = mainProjectCards.find((card) => card.folderName === 'H823H Drone（blue）')?.images ?? [];
+
+const allProjectCards = [
+    ...mainProjectCards,
+    ...aplusProjectCards,
+    ...socialProjectCards,
+    ...brandProjectCards,
+    ...packagingProjectCards,
+    ...cesProjectCards,
+    ...otherProjectCards,
+];
+
+const responsiveSourceUrls = new Set<string>([
+    '/1shouye/1ya.png',
+    '/1shouye/ms.png',
+    '/1shouye/methodology-reference.png',
+    '/tex/toux.jpg',
+    ...waterfallImages.map((image) => image.src),
+    ...allProjectCards.flatMap((card) => [card.coverSrc, ...card.images]),
+    'https://placehold.co/400x300/4a90e2/fff?text=Robot+Vacuum',
+    'https://placehold.co/400x300/ff6b6b/fff?text=Hair+Dryer',
+    'https://placehold.co/400x300/2ecc71/fff?text=Air+Purifier',
+    'https://placehold.co/400x300/9b59b6/fff?text=Portable+Fan',
+    'https://placehold.co/400x300/34495e/fff?text=Coffee+Maker',
+    'https://placehold.co/400x300/f39c12/fff?text=Massage+Gun',
+    'https://placehold.co/400x300/1abc9c/fff?text=Security+Cam',
+    'https://placehold.co/400x300/7f8c8d/fff?text=Desk+Lamp',
+    'https://placehold.co/400x300/e67e22/fff?text=Water+Bottle',
+    'https://placehold.co/400x300/95a5a6/fff?text=Travel+Bag',
+    'https://placehold.co/400x300/00b894/fff?text=Kitchen+Scale',
+    'https://placehold.co/400x300/6c5ce7/fff?text=Bluetooth+Speaker',
+    'https://placehold.co/400x300/0984e3/fff?text=Phone+Stand',
+    'https://placehold.co/400x300/bc6c25/fff?text=Car+Vacuum',
+    'https://placehold.co/400x300/d63031/fff?text=Sleep+Mask',
+    'https://placehold.co/400x300/2d3436/fff?text=Mini+Projector',
+    'https://placehold.co/400x300/8e44ad/fff?text=Smart+Scale',
+    'https://placehold.co/400x300/1e3799/fff?text=Desk+Fan',
+    'https://placehold.co/400x300/27ae60/fff?text=Air+Fryer',
+    'https://placehold.co/400x300/ff7675/fff?text=Hair+Curler',
+    'https://placehold.co/400x300/00cec9/fff?text=USB+Hub',
+    'https://placehold.co/400x300/636e72/fff?text=Pet+Camera',
+    'https://placehold.co/400x300/e17055/fff?text=Water+Flosser',
+    'https://placehold.co/400x300/74b9ff/fff?text=LED+Lamp',
+    'https://placehold.co/400x300/55efc4/fff?text=Smart+Plug',
+    'https://placehold.co/400x300/ff9f1c/fff?text=Electric+Toothbrush',
+    'https://placehold.co/400x300/81ecec/fff?text=Robot+Mop',
+    'https://placehold.co/400x300/6ab04c/fff?text=Portable+Charger',
+    'https://placehold.co/400x300/fd79a8/fff?text=Beauty+Tool',
+]);
+
+const responsiveImageEntries = await Promise.all(
+    Array.from(responsiveSourceUrls).map(async (src) => [src, await getResponsiveImageData(src)] as const)
+);
+
+const responsiveImageCatalog = new Map<string, ResponsiveImageData>(responsiveImageEntries);
+const runtimeResponsiveImageCatalog = Object.fromEntries(responsiveImageEntries);
+
+function getCatalogImageAttrs(src: string, sizes: string, loading: 'lazy' | 'eager' = 'lazy') {
+    return responsiveImgAttrs(responsiveImageCatalog.get(src), sizes, loading);
+}
+---
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>庞宇 | 全链路跨境品牌视觉专家</title>
+    <style>
+        /* === 全局重置与基础样式 === */
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html { scroll-behavior: smooth; overscroll-behavior-y: none; }
+        body { 
+            font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; 
+            line-height: 1.6; 
+            color: #333; 
+            background: linear-gradient(180deg, #faf7f2 0%, #f4f4f4 100%); 
+            overflow-x: hidden; 
+        }
+        body.media-protect,
+        body.media-protect * {
+            -webkit-touch-callout: none;
+        }
+        body.edge-bounce-top { animation: edgeBounceTop 0.34s cubic-bezier(0.2, 0.7, 0.2, 1); }
+        body.edge-bounce-bottom { animation: edgeBounceBottom 0.34s cubic-bezier(0.2, 0.7, 0.2, 1); }
+        a { text-decoration: none; color: inherit; transition: 0.3s; }
+        img, video { max-width: 100%; display: block; }
+        img, video { -webkit-user-drag: none; user-select: none; }
+        img { height: auto; }
+
+        /* === 导航栏 === */
+        nav { 
+            position: fixed; top: 0; width: 100%; 
+            background: rgba(255, 255, 255, 0.7); 
+            backdrop-filter: blur(12px) saturate(180%); z-index: 1000; 
+            padding: 15px 5%; display: flex; 
+            justify-content: space-between; align-items: center; 
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08); 
+            transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.3s ease;
+        }
+        nav.nav-hidden { transform: translateY(-100%); }
+        .logo { 
+            font-size: 1.5rem; font-weight: 800; letter-spacing: -1px; cursor: pointer; user-select: none;
+        }
+        .logo .brand-orange { color: #ff9900; }
+        .logo .brand-black { color: #000; }
+        .nav-links a { 
+            margin-left: 30px; font-weight: 600; font-size: 0.9rem; 
+            text-transform: uppercase; position: relative; padding: 5px 0; 
+        }
+        .nav-links a::after { 
+            content: ''; position: absolute; bottom: 0; left: 0; width: 100%; 
+            height: 2px; background-color: #ff9900; transform: scaleX(0); 
+            transition: transform 0.3s ease; 
+        }
+        .nav-links a:hover { color: #ff9900; }
+        .nav-links a:hover::after { transform: scaleX(1); }
+
+        /* === 通用区块样式 === */
+        section { padding: 110px clamp(24px, 5vw, 72px); }
+        .container { max-width: 1480px; margin: 0 auto; }
+        .section-title { font-size: 2.7rem; margin-bottom: 10px; font-weight: 800; letter-spacing: -0.02em; }
+        .section-subtitle { color: #666; margin-bottom: 46px; font-size: 1.08rem; max-width: 920px; }
+        .highlight { color: #ff9900; }
+
+        /* === 1. 首页 Hero === */
+        #home { 
+            position: relative; height: 100vh; display: flex; align-items: center; justify-content: center; 
+            text-align: center; background: linear-gradient(rgba(0,0,0,0.58), rgba(0,0,0,0.7)), url('/1shouye/TOUTU.jpg'); 
+            background-size: cover; background-position: calc(50% + var(--hero-shift-x, 0px)) calc(50% + var(--hero-shift-y, 0px)); color: #fff; padding-top: 80px; 
+            animation: bgPan 18s ease-in-out infinite;
+        }
+        @media (min-width: 769px) {
+            #home {
+                background-image: linear-gradient(rgba(0,0,0,0.52), rgba(0,0,0,0.68)), url('/1shouye/TOUTU.jpg');
+            }
+        }
+        .hero-tag { 
+            background: #ff9900; color: #000; padding: 5px 15px; 
+            border-radius: 20px; font-size: 0.8rem; font-weight: bold; 
+            display: inline-block; margin-bottom: 20px; 
+        }
+        .hero-title { font-size: 4rem; margin-bottom: 20px; line-height: 1.1; }
+        .hero-stats { display: flex; gap: 50px; justify-content: center; margin-top: 40px; }
+        .stat-item h3 { font-size: 3rem; color: #ff9900; min-width: 80px; display: inline-block; }
+
+        /* === 2. 作品展示 === */
+        .filter-tabs { display: flex; gap: 14px; margin-bottom: 32px; flex-wrap: wrap; scroll-behavior: smooth; }
+        .filter-tabs-shell { margin-bottom: 34px; }
+        .works-toolbar {
+            display: grid;
+            grid-template-columns: minmax(240px, 420px) 1fr;
+            gap: 14px 18px;
+            align-items: start;
+            margin-bottom: 18px;
+        }
+        .works-search {
+            position: relative;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 14px;
+            border-radius: 18px;
+            background: rgba(255,255,255,0.9);
+            border: 1px solid rgba(255,153,0,0.18);
+            box-shadow: 0 10px 24px rgba(0,0,0,0.06);
+        }
+        .works-search-icon { color: #ff9900; font-size: 1rem; flex: 0 0 auto; }
+        .works-search-input {
+            width: 100%;
+            border: none;
+            outline: none;
+            background: transparent;
+            color: #222;
+            font-size: 0.95rem;
+            min-width: 0;
+        }
+        .works-search-input::placeholder { color: #9c9c9c; }
+        .works-search-clear {
+            border: none;
+            background: #f4f4f4;
+            color: #666;
+            width: 30px;
+            height: 30px;
+            border-radius: 999px;
+            cursor: pointer;
+            flex: 0 0 auto;
+            transition: all 0.2s ease;
+        }
+        .works-search-clear:hover { background: #ffe0b3; color: #000; }
+        .works-search-meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            align-items: center;
+            justify-content: flex-end;
+        }
+        .works-search-stat {
+            color: #666;
+            font-size: 0.85rem;
+            font-weight: 600;
+            padding: 8px 10px;
+            border-radius: 999px;
+            background: rgba(255,255,255,0.8);
+            border: 1px solid rgba(0,0,0,0.05);
+        }
+        .works-hotkeys {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            justify-content: flex-end;
+        }
+        .works-hotkey {
+            border: 1px solid rgba(255,153,0,0.18);
+            background: rgba(255,244,224,0.92);
+            color: #8a4d00;
+            border-radius: 999px;
+            padding: 8px 12px;
+            font-size: 0.8rem;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        .works-hotkey:hover { transform: translateY(-1px); background: #ffd89c; }
+        .works-no-results {
+            display: none;
+            margin: 24px 0 8px;
+            padding: 22px 18px;
+            border-radius: 18px;
+            background: linear-gradient(135deg, rgba(255,249,236,0.95), rgba(255,241,219,0.95));
+            border: 1px dashed rgba(255,153,0,0.35);
+            color: #8a5a00;
+            text-align: center;
+            font-weight: 600;
+        }
+        .works-no-results strong { color: #ff9900; }
+        .search-match {
+            background: linear-gradient(180deg, rgba(255, 230, 160, 0.95), rgba(255, 199, 92, 0.95));
+            color: #1f1f1f;
+            padding: 0 4px;
+            border-radius: 4px;
+        }
+        .filter-scroll-tip {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 10px;
+            color: #8b8b8b;
+            font-size: 0.76rem;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            user-select: none;
+        }
+        .filter-scroll-tip span { white-space: nowrap; }
+        .filter-scroll-track {
+            position: relative;
+            flex: 1;
+            height: 6px;
+            border-radius: 999px;
+            background: linear-gradient(90deg, rgba(255,153,0,0.12), rgba(255,153,0,0.35), rgba(255,153,0,0.12));
+            overflow: hidden;
+        }
+        .filter-scroll-track::before {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.22), transparent);
+            animation: scrollTrackShimmer 2.8s ease-in-out infinite;
+        }
+        .filter-scroll-track::after {
+            content: '';
+            position: absolute;
+            left: 18%;
+            top: 50%;
+            width: 34%;
+            height: 4px;
+            border-radius: 999px;
+            background: linear-gradient(90deg, #ffd36a, #ff9900);
+            box-shadow: 0 0 16px rgba(255, 153, 0, 0.38);
+            transform: translateY(-50%);
+            animation: scrollThumbMove 2.8s ease-in-out infinite;
+        }
+        .filter-btn { 
+            padding: 10px 24px; border: 1.5px solid rgba(255, 153, 0, 0.5); border-radius: 32px; 
+            background: linear-gradient(135deg, rgba(255, 235, 180, 0.6) 0%, rgba(255, 140, 60, 0.5) 100%);
+            backdrop-filter: blur(16px) saturate(180%); 
+            cursor: pointer; font-weight: 600; font-size: 0.9rem; 
+            color: #333; transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); 
+            box-shadow: 0 2px 10px rgba(255, 153, 0, 0.15), inset 0 1px 0 rgba(255, 255, 255, 0.4);
+        }
+        .filter-btn:hover { background: linear-gradient(135deg, rgba(255, 180, 80, 0.8) 0%, rgba(255, 80, 20, 0.7) 100%); border-color: rgba(255, 153, 0, 0.7); color: #fff; transform: translateY(-2px); box-shadow: 0 4px 16px rgba(255, 153, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.5); }
+        .filter-btn.active { background: linear-gradient(135deg, rgba(255, 120, 40, 0.95) 0%, rgba(200, 60, 10, 0.85) 100%); border-color: rgba(255, 100, 20, 0.9); color: #fff; box-shadow: 0 6px 20px rgba(255, 80, 20, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.2); }
+        .filter-btn.glow-active { animation: glowRipple 0.8s ease-out; }
+        #works .filter-btn[data-filter="all"] { display: none !important; }
+
+        .waterfall-panel {
+            display: none;
+            margin-bottom: 28px;
+            border-radius: 14px;
+            overflow: hidden;
+            background: #fff;
+            box-shadow: 0 6px 18px rgba(0,0,0,0.07);
+        }
+        .waterfall-panel.active { display: block; }
+        .waterfall-grid {
+            position: relative;
+            background: #fff;
+        }
+        .waterfall-item {
+            position: absolute;
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+        }
+        .waterfall-block {
+            width: 100%;
+            display: block;
+            border-radius: 0;
+        }
+        .waterfall-block img {
+            width: 100%;
+            display: block;
+            object-fit: cover;
+            transition: transform 0.35s ease;
+        }
+        .waterfall-block video {
+            width: 100%;
+            display: block;
+            object-fit: cover;
+            background: #111;
+            transition: transform 0.35s ease;
+        }
+        .waterfall-block:hover img { transform: scale(1.02); }
+        .waterfall-block:hover video { transform: scale(1.02); }
+        .waterfall-item.wf-hidden { display: none; }
+        .waterfall-more-wrap {
+            display: flex;
+            justify-content: center;
+            padding: 18px 0 22px;
+            background: #fff;
+        }
+        .waterfall-more-wrap.wf-all-shown { display: none; }
+        .waterfall-done-wrap {
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            gap: 14px;
+            padding: 28px 16px 34px;
+            background: linear-gradient(to bottom, #fff 0%, rgba(255, 248, 240, 0.7) 100%);
+        }
+        .waterfall-done-wrap.wf-all-shown { display: flex; }
+        .waterfall-done-label {
+            font-size: 12px;
+            color: #c0a898;
+            letter-spacing: 0.12em;
+            user-select: none;
+        }
+        .waterfall-back-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 12px 44px;
+            border-radius: 999px;
+            border: 1.5px solid rgba(255, 120, 40, 0.55);
+            background: linear-gradient(135deg, rgba(255, 248, 235, 0.95) 0%, rgba(255, 235, 200, 0.8) 100%);
+            color: #c05010;
+            font-size: 15px;
+            font-weight: 700;
+            cursor: pointer;
+            letter-spacing: 0.04em;
+            box-shadow: 0 2px 10px rgba(255, 120, 40, 0.1);
+            transition: background 0.22s, box-shadow 0.22s, transform 0.18s, color 0.18s;
+            animation: wfBackFloat 2s ease-in-out infinite;
+        }
+        .waterfall-back-btn:hover {
+            background: linear-gradient(135deg, rgba(255, 180, 80, 0.9) 0%, rgba(255, 80, 20, 0.8) 100%);
+            color: #fff;
+            border-color: rgba(255, 153, 0, 0.8);
+            box-shadow: 0 6px 20px rgba(255, 100, 20, 0.35);
+            transform: translateY(-3px);
+            animation: none;
+        }
+        @keyframes wfBackFloat {
+            0%, 100% { transform: translateY(0); }
+            50% { transform: translateY(-4px); }
+        }
+        .waterfall-more-btn {
+            padding: 10px 36px;
+            border-radius: 999px;
+            border: 1.5px solid rgba(255, 120, 40, 0.7);
+            background: linear-gradient(135deg, rgba(255, 180, 80, 0.15) 0%, rgba(255, 80, 20, 0.08) 100%);
+            color: #c74a10;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.22s, box-shadow 0.22s, transform 0.18s;
+        }
+        .waterfall-more-btn:hover {
+            background: linear-gradient(135deg, rgba(255, 180, 80, 0.8) 0%, rgba(255, 80, 20, 0.7) 100%);
+            color: #fff;
+            border-color: rgba(255, 153, 0, 0.7);
+            box-shadow: 0 4px 16px rgba(255, 153, 0, 0.3);
+            transform: translateY(-2px);
+        }
+        
+        .massive-grid-wrap { position: relative; }
+        .massive-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 24px; align-items: start; }
+        .work-pagination {
+            margin-top: 26px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+        .work-pagination[hidden] { display: none !important; }
+        .work-pagination .page-nav {
+            border: 1px solid #e4e4e4;
+            background: #fff;
+            color: #222;
+            border-radius: 999px;
+            padding: 7px 14px;
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        .work-pagination .page-nav:hover:not(:disabled) {
+            border-color: #ff9900;
+            color: #ff9900;
+        }
+        .work-pagination .page-nav:disabled {
+            opacity: 0.35;
+            cursor: not-allowed;
+        }
+        .work-pagination .page-number-list {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+        .work-pagination .page-number {
+            width: 34px;
+            height: 34px;
+            border-radius: 10px;
+            border: 1px solid #e4e4e4;
+            background: #fff;
+            color: #222;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        .work-pagination .page-number:hover {
+            border-color: #ff9900;
+            color: #ff9900;
+        }
+        .work-pagination .page-number.active {
+            background: #ff9900;
+            border-color: #ff9900;
+            color: #000;
+            box-shadow: 0 6px 16px rgba(255, 153, 0, 0.25);
+        }
+        .work-pagination .page-visual {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 0 2px;
+        }
+        .work-pagination .page-visual-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 999px;
+            border: none;
+            background: #e0e0e0;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        .work-pagination .page-visual-dot:hover { background: #ffbd57; }
+        .work-pagination .page-visual-dot.active {
+            width: 24px;
+            background: #ff9900;
+        }
+        .project-card { 
+            background: #fff; border-radius: 18px; overflow: hidden; 
+            box-shadow: 0 8px 24px rgba(0,0,0,0.08); transition: all 0.38s cubic-bezier(0.2, 0.8, 0.2, 1); 
+            cursor: pointer; position: relative; border: 1px solid rgba(0,0,0,0.04); 
+        }
+        .project-card:hover { transform: translateY(-7px) scale(1.01); box-shadow: 0 18px 34px rgba(0,0,0,0.13); }
+        .project-thumb { height: 220px; background: #eee; overflow: hidden; position: relative; }
+        .project-thumb img { width: 100%; height: 100%; object-fit: cover; object-position: center; transition: transform 0.5s ease; background: #eee; }
+        .project-thumb video { width: 100%; height: 100%; object-fit: cover; object-position: center; transition: transform 0.5s ease; background: #eee; }
+        .project-thumb :global(.video-fallback-image) { position: absolute; inset: 0; opacity: 0; pointer-events: none; }
+        .project-thumb.video-error video { opacity: 0; }
+        .project-thumb.video-error :global(.video-fallback-image) { opacity: 1; }
+        .project-card:hover .project-thumb img,
+        .project-card:hover .project-thumb video { transform: scale(1.06); }
+        .project-info { padding: 18px 20px 16px; }
+        .project-info h4 { font-size: 1.05rem; margin-bottom: 6px; }
+        .project-info span { font-size: 0.84rem; color: #888; }
+        .project-card .gallery-hint { font-size: 0.8rem; color: #ff9900; margin-top: 8px; font-weight: 600; }
+        .project-gallery { display: none; padding: 0 20px 20px; }
+        .project-card.expanded .project-gallery { display: block; animation: fadeInUp 0.28s ease-out; }
+        .project-gallery-preview { display: grid; grid-template-columns: 1fr; gap: 12px; align-items: stretch; }
+        .project-gallery-preview .main-preview { height: 200px; border-radius: 12px; overflow: hidden; position: relative; background: #f4f4f4; }
+        .project-gallery-preview .main-preview img { width: 100%; height: 100%; object-fit: cover; object-position: center; transition: transform 0.35s ease; background: #f4f4f4; }
+        .project-gallery-preview .main-preview:hover img { transform: scale(1.03); }
+        .compact-preview { grid-template-columns: 1fr; }
+        .project-card.expanded { box-shadow: 0 16px 32px rgba(0,0,0,0.14); }
+        @keyframes fadeInUp {
+            from { opacity: 0; transform: translateY(6px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        @keyframes scrollTrackShimmer {
+            0% { opacity: 0.5; transform: translateX(-10%); }
+            50% { opacity: 1; transform: translateX(10%); }
+            100% { opacity: 0.5; transform: translateX(-10%); }
+        }
+
+        @keyframes scrollThumbMove {
+            0% { transform: translateY(-50%) translateX(0); }
+            50% { transform: translateY(-50%) translateX(32%); }
+            100% { transform: translateY(-50%) translateX(0); }
+        }
+
+        /* subtle background pan for hero */
+        @keyframes bgPan {
+            0% { background-position: calc(50% + var(--hero-shift-x, 0px)) calc(42% + var(--hero-shift-y, 0px)); }
+            50% { background-position: calc(50% + var(--hero-shift-x, 0px)) calc(50% + var(--hero-shift-y, 0px)); }
+            100% { background-position: calc(50% + var(--hero-shift-x, 0px)) calc(42% + var(--hero-shift-y, 0px)); }
+        }
+
+        @keyframes edgeBounceTop {
+            0% { transform: translateY(0); }
+            45% { transform: translateY(8px); }
+            100% { transform: translateY(0); }
+        }
+
+        @keyframes edgeBounceBottom {
+            0% { transform: translateY(0); }
+            45% { transform: translateY(-6px); }
+            100% { transform: translateY(0); }
+        }
+
+        /* floating hero title */
+        @keyframes floatUpDown {
+            0% { transform: translateY(0); }
+            50% { transform: translateY(-6px); }
+            100% { transform: translateY(0); }
+        }
+
+        /* button click glow ripple effect */
+        @keyframes glowRipple {
+            0% {
+                box-shadow: inset 0 0 15px rgba(255, 150, 80, 0.3), inset 0 0 25px rgba(100, 150, 255, 0);
+                opacity: 1;
+            }
+            25% {
+                box-shadow: inset 0 0 30px rgba(255, 150, 80, 0.6), inset 0 0 20px rgba(100, 150, 255, 0.3);
+                opacity: 0.98;
+            }
+            50% {
+                box-shadow: inset 0 0 35px rgba(150, 180, 255, 0.7), inset 0 0 25px rgba(255, 180, 100, 0.4);
+                opacity: 0.95;
+            }
+            75% {
+                box-shadow: inset 0 0 30px rgba(100, 150, 255, 0.6), inset 0 0 20px rgba(255, 150, 80, 0.3);
+                opacity: 0.92;
+            }
+            100% {
+                box-shadow: inset 0 0 5px rgba(255, 150, 80, 0), inset 0 0 10px rgba(100, 150, 255, 0);
+                opacity: 0.8;
+            }
+        }
+
+        .hero-title { animation: floatUpDown 6s ease-in-out infinite; }
+
+        /* amazon badge in hero */
+        .amazon-badge { position: absolute; right: 20px; bottom: 20px; z-index: 50; display: inline-block; }
+        .amazon-badge svg { display: block; border-radius: 6px; }
+        .amazon-badge img { display: block; width: 80px; height: auto; border-radius: 6px; }
+        .lightbox-overlay {
+            position: fixed; inset: 0; background: rgba(0,0,0,0.85); display: none; align-items: center; justify-content: center; z-index: 2000; padding: 0;
+        }
+        .lightbox-overlay.active { display: flex; }
+        .lightbox-content {
+            position: relative; max-width: min(82vw, 980px); width: 100%; max-height: 88vh; background: #fff; border-radius: 16px; overflow: hidden; box-shadow: 0 20px 50px rgba(0,0,0,0.3); display: flex; flex-direction: column;
+        }
+        .lightbox-scroll-area { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 0; background: #111; overscroll-behavior: contain; scroll-behavior: smooth; scrollbar-gutter: stable; }
+        .lightbox-gallery { display: flex; flex-direction: column; gap: 0; background: #111; min-height: 100%; height: 100%; }
+        .lightbox-gallery :global(.lightbox-media-frame) {
+            width: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+            background: #f4f4f4;
+            flex: 0 0 auto;
+            min-height: 100%;
+            height: 100%;
+        }
+        .lightbox-gallery :global(img),
+        .lightbox-gallery :global(video) {
+            width: 100%;
+            height: 100%;
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: cover;
+            object-position: center;
+            display: block;
+            background: #f4f4f4;
+            border-radius: 0;
+        }
+        .lightbox-gallery :global(img) { cursor: zoom-out; }
+        .lightbox-gallery :global(video) { background: #000; }
+        .lightbox-close, .lightbox-nav {
+            position: absolute; top: 16px; background: rgba(0,0,0,0.7); color: #fff; border: none; border-radius: 50%; width: 42px; height: 42px; cursor: pointer; font-size: 1.1rem; z-index: 2;
+        }
+        .lightbox-close { right: 16px; }
+        .lightbox-nav.prev { left: 16px; }
+        .lightbox-nav.next { right: 16px; top: 50%; transform: translateY(-50%); }
+        .lightbox-caption { padding: 12px 20px 16px; font-size: 0.95rem; color: #333; border-top: 1px solid #f0f0f0; background: #fff; }
+
+        /* === 3. AI 赋能提效 === */
+        /* === 移动端调整：卡片更紧凑、字体更小、横向滑动提示 === */
+        @media (max-width: 640px) {
+            .massive-grid-wrap { position: relative; padding-top: 34px; padding-bottom: 10px; }
+            .filter-tabs-shell { margin-bottom: 32px; }
+            .works-toolbar { grid-template-columns: 1fr; gap: 10px; margin-bottom: 14px; }
+            .works-search-meta { justify-content: flex-start; }
+            .filter-scroll-tip { gap: 8px; margin-bottom: 8px; font-size: 0.66rem; }
+            .filter-scroll-track { height: 5px; }
+            .filter-scroll-track::after { width: 42%; left: 12%; }
+            .filter-tabs {
+                gap: 6px;
+                margin-bottom: 14px;
+                overflow-x: auto;
+                overflow-y: visible;
+                flex-wrap: nowrap;
+                padding: 8px 0 4px;
+                scrollbar-width: none;
+                -webkit-overflow-scrolling: touch;
+                overscroll-behavior-x: contain;
+            }
+            .filter-tabs::-webkit-scrollbar { display: none; }
+            .filter-btn {
+                padding: 5px 8px;
+                font-size: 0.68rem;
+                border-radius: 999px;
+                line-height: 1.05;
+                min-height: 24px;
+                white-space: nowrap;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                transform: none;
+                border: 1px solid rgba(255, 153, 0, 0.5);
+            }
+            .filter-btn:hover, .filter-btn:active, .filter-btn:focus-visible { transform: none; }
+            .works-search { padding: 9px 12px; border-radius: 16px; }
+            .works-search-stat { font-size: 0.76rem; }
+            .massive-grid:not(.mobile-main-scroll) {
+                display: block;
+                column-count: 2;
+                column-gap: 8px;
+                column-fill: auto;
+                overflow: visible;
+                padding: 2px 2px 8px;
+            }
+            #works .massive-grid:not(.mobile-main-scroll) > .project-card {
+                width: 100%;
+                min-width: 0;
+                max-width: none;
+                height: auto;
+                aspect-ratio: auto;
+                display: flex;
+                flex-direction: column;
+                border-radius: 10px;
+                transform: none;
+                break-inside: avoid;
+                margin-bottom: 8px;
+            }
+            #works .project-thumb { flex: 1 1 auto; min-height: 0; }
+            #works .project-thumb { aspect-ratio: auto; height: auto; }
+            #works .project-thumb img { width: 100%; height: 100%; object-fit: cover; object-position: center; }
+            #works .project-thumb video { width: 100%; height: 100%; object-fit: cover; object-position: center; }
+            #works .massive-grid.mobile-main-scroll .project-thumb { aspect-ratio: 2 / 1; }
+            #works .massive-grid.mobile-main-scroll > .project-card {
+                width: var(--mobile-card-width);
+                height: var(--mobile-card-height);
+                min-height: var(--mobile-card-height);
+                aspect-ratio: auto;
+            }
+            #works .massive-grid.mobile-main-scroll .project-thumb { flex: 0 0 auto; }
+            #works .massive-grid.mobile-main-scroll .project-info { flex: 1 1 auto; min-height: 0; overflow: hidden; }
+            .project-gallery { padding: 0 8px 8px; }
+            .project-info { padding: 8px; }
+            .project-info h4 { font-size: 0.86rem; margin-bottom: 4px; line-height: 1.2; }
+            .project-info span, .project-card .gallery-hint { font-size: 0.64rem; }
+            .project-gallery { padding: 0 10px 10px; }
+            .project-card .gallery-hint { font-size: 0.62rem; }
+            .massive-grid-wrap::after { content: none; }
+            .waterfall-grid { /* 3-col handled by JS */ }
+            .contact-status { bottom: -18px; }
+            .work-pagination { margin-top: 16px; gap: 10px; }
+            .work-pagination .page-number { width: 30px; height: 30px; font-size: 0.78rem; }
+            .work-pagination .page-nav { padding: 6px 10px; font-size: 0.74rem; }
+        }
+        #ai-power { background: #111; color: #fff; }
+        #ai-power .section-subtitle { color: #aaa; }
+        .ai-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 30px; margin-bottom: 50px; }
+        .ai-stat-box { 
+            background: #222; padding: 30px; border-radius: 10px; text-align: center; 
+            border: 1px solid #333; transition: all 0.3s ease; 
+        }
+        .ai-stat-box:hover { transform: translateY(-5px); border-color: #ff9900; box-shadow: 0 10px 20px rgba(255, 153, 0, 0.1); }
+        .ai-stat-box h3 { font-size: 2.5rem; color: #ff9900; min-width: 60px; display: inline-block; }
+        .ai-stat-box p { color: #aaa; margin-top: 10px; }
+        .tech-stack { margin-top: 60px; text-align: center; }
+        .tech-stack p { color: #888; margin-bottom: 20px; text-transform: uppercase; letter-spacing: 2px; font-size: 0.9rem; }
+        .tech-stack span { 
+            font-size: 1.2rem; font-weight: bold; color: #fff; margin: 0 15px; 
+            display: inline-block; margin-bottom: 10px; padding: 8px 20px; 
+            background: linear-gradient(135deg, rgba(100, 120, 160, 0.75) 0%, rgba(20, 80, 140, 0.65) 100%);
+            backdrop-filter: blur(16px) saturate(180%); 
+            border-radius: 32px; border: 1.5px solid rgba(150, 180, 220, 0.3); 
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.15);
+        }
+        .tech-stack span:hover { background: linear-gradient(135deg, rgba(255, 130, 60, 0.9) 0%, rgba(220, 40, 0, 0.8) 100%); border-color: rgba(255, 150, 80, 0.7); color: #fff; transform: translateY(-3px); box-shadow: 0 4px 16px rgba(255, 80, 20, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.25); }
+        .software-stack {
+            margin-top: 0;
+            background: transparent;
+            border-radius: 0;
+            padding: 22px clamp(24px, 5vw, 64px) 16px;
+            text-align: center;
+        }
+        .software-stack p { color: #6e3b00; margin-bottom: 14px; letter-spacing: 1px; font-size: 0.9rem; font-weight: 700; }
+        .software-stack span {
+            font-size: 1.2rem; font-weight: bold; color: #1a1a1a; margin: 0 10px;
+            display: inline-block; margin-bottom: 10px; padding: 8px 20px;
+            background: linear-gradient(135deg, rgba(255, 250, 200, 0.85) 0%, rgba(180, 220, 255, 0.75) 100%);
+            backdrop-filter: blur(16px) saturate(180%);
+            border-radius: 32px; border: 1.5px solid rgba(255, 200, 100, 0.6);
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.15), inset 0 1px 0 rgba(255, 255, 255, 0.6);
+        }
+        .software-stack span:hover { background: linear-gradient(135deg, rgba(255, 255, 240, 0.95) 0%, rgba(150, 200, 255, 0.85) 100%); border-color: rgba(255, 150, 60, 0.8); transform: translateY(-3px); box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.7); }
+        #software-tools { background: #ff9900; padding: 0; }
+        
+        #contact .container { max-width: 680px; margin: 0 auto; text-align: center; }
+        .methodology-wrapper { 
+            display: grid; grid-template-columns: 1.6fr 0.72fr; gap: 80px; 
+            align-items: center; background: #fff; padding: 68px; 
+            border-radius: 15px; box-shadow: 0 5px 20px rgba(0,0,0,0.05); 
+        }
+        #methodology .container { max-width: 1760px; }
+        .method-chart { 
+            background: #111; height: auto; border-radius: 10px; 
+            display: flex; align-items: center; justify-content: center; 
+            font-size: 1.2rem; color: #999; border: 2px dashed #ddd; 
+            transition: all 0.3s ease; 
+            overflow: hidden;
+            cursor: zoom-in;
+        }
+        .method-chart:hover { border-color: #ff9900; background: #f9f9f9; transform: scale(1.01); }
+        .method-chart img { width: 100%; max-width: none; height: auto; object-fit: contain; display: block; }
+        .method-steps { list-style: none; padding-left: 22px; }
+        .method-steps li { 
+            margin-bottom: 20px; padding-left: 30px; position: relative; 
+            transition: transform 0.3s ease; cursor: default; 
+        }
+        .method-steps li:hover { transform: translateX(5px); }
+        .method-steps li::before { 
+            content: ''; position: absolute; left: 0; top: 5px; width: 15px; 
+            height: 15px; background: #ff9900; border-radius: 50%; 
+            transition: all 0.3s ease; 
+        }
+        .method-steps li:hover::before { background: #ffcc00; transform: scale(1.2); }
+
+        /* === 5. 亚马逊百强 === */
+        #amazon-rank { background: #fff; }
+        .chart-container { 
+            background: #fff; padding: 20px; border-radius: 15px; 
+            box-shadow: 0 5px 20px rgba(0,0,0,0.05); margin-bottom: 50px; 
+        }
+        .chart-preview {
+            width: 100%;
+            height: auto;
+            aspect-ratio: 1554 / 730;
+            background: linear-gradient(135deg, #fff7ed 0%, #ffe7cc 100%);
+            border-radius: 10px; display: flex; align-items: center; justify-content: center;
+            border: 1px dashed #ffbb77; color: #8a4b00; cursor: pointer; position: relative; overflow: hidden;
+            font-weight: 600; text-align: center; padding: 0;
+        }
+        .chart-preview img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: block;
+        }
+        .chart-preview:hover { transform: translateY(-2px); box-shadow: 0 8px 20px rgba(0,0,0,0.08); }
+        .rank-item { 
+            display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px 14px; padding: 18px 20px; 
+            border-bottom: 1px solid #eee; font-size: 1rem; transition: all 0.3s ease; 
+            border-radius: 8px; cursor: pointer; align-items: start; }
+        .rank-item:hover { background-color: #f9f9f9; transform: translateX(5px); box-shadow: 0 3px 10px rgba(0,0,0,0.05); }
+        .rank-item:last-child { border-bottom: none; }
+        .rank-item.expanded { background: #fff7ed; border-color: #ffcc99; }
+        .rank-item > div:first-child { min-width: 0; }
+        .rank-num { font-weight: 800; color: #e74c3c; }
+        .rank-gallery { display: none; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 0; padding: 0 4px 4px; grid-column: 1 / -1; }
+        .rank-item.expanded .rank-gallery { display: grid; }
+        .rank-gallery :global(img) { width: 100%; height: 110px; object-fit: cover; border-radius: 8px; border: 1px solid #f0f0f0; }
+        .rank-gallery :global(.gallery-more) { display: flex; align-items: center; justify-content: center; background: #f5f5f5; color: #666; font-size: 0.9rem; border-radius: 8px; border: 1px dashed #ddd; }
+
+        /* === 6. 联系 === */
+        #contact { background: #111; color: #fff; text-align: center; padding: 110px 5%; }
+        .contact-card { display: flex; align-items: center; justify-content: center; gap: 22px; flex-wrap: wrap; padding: 40px 0 24px; width: 100%; }
+        .contact-avatar { width: 96px; height: 96px; border-radius: 50%; overflow: hidden; border: 3px solid #fff; background: #eee; cursor: default; flex: 0 0 96px; position: relative; }
+        .contact-avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
+        /* place status badge just outside avatar: left-bottom */
+        .contact-status { position: absolute; left: -10px; bottom: -10px; display: flex; align-items: center; gap: 6px; transform: translateZ(0); }
+        .contact-status .dot { width: 12px; height: 12px; border-radius: 50%; background: #28c76f; box-shadow: 0 0 6px rgba(40,199,111,0.6); border: 2px solid #fff; }
+        .contact-status .text { color: #dfffe6; font-size: 0.78rem; font-weight: 700; text-shadow: 0 1px 0 rgba(0,0,0,0.2); }
+        .contact-info { text-align: left; color: #fff; }
+        .contact-info h3 { margin: 0 0 6px; font-size: 1.1rem; }
+        .contact-info p { margin: 2px 0; color: #ddd; font-size: 0.95rem; }
+        .contact-actions { margin-top: 8px; }
+        .contact-actions a { display: inline-block; margin-right: 12px; padding: 10px 18px; border-radius: 32px; background: linear-gradient(135deg, rgba(255, 160, 80, 0.85) 0%, rgba(220, 60, 20, 0.75) 100%); backdrop-filter: blur(12px); color: #fff; font-weight: 700; text-decoration: none; border: 1px solid rgba(255, 255, 255, 0.25); transition: all 0.3s ease; }
+        .contact-hint { font-size: 0.82rem; color: #bbb; margin-top: 8px; }
+        .btn { 
+            display: inline-block; padding: 15px 40px; 
+            background: linear-gradient(135deg, rgba(255, 160, 80, 0.85) 0%, rgba(220, 60, 20, 0.75) 100%); 
+            backdrop-filter: blur(12px); color: #fff; font-weight: bold; border-radius: 32px; margin-top: 30px; 
+            transition: all 0.3s ease; border: 1px solid rgba(255, 255, 255, 0.25);
+            box-shadow: 0 4px 12px rgba(255, 100, 20, 0.25);
+        }
+
+        .btn:hover { background: linear-gradient(135deg, rgba(255, 120, 50, 0.95) 0%, rgba(200, 40, 0, 0.85) 100%); transform: scale(1.05); box-shadow: 0 8px 20px rgba(255, 80, 20, 0.4); }
+        .btn:active { transform: scale(0.98); }
+        .btn.glow-active { animation: glowRipple 0.8s ease-out; }
+        .contact-actions a:hover { background: linear-gradient(135deg, rgba(255, 130, 60, 0.9) 0%, rgba(220, 40, 0, 0.8) 100%); transform: translateY(-2px); box-shadow: 0 4px 16px rgba(255, 100, 20, 0.25), inset 0 0 15px rgba(255, 180, 100, 0.3); }
+        .contact-actions a.glow-active { animation: glowRipple 0.8s ease-out; }
+
+        /* === 响应式（移动端优化） === */
+        /* Mobile nav and touch improvements */
+        #mobile-nav-toggle { display: none; position: relative; background: transparent; border: none; font-size: 1.6rem; cursor: pointer; padding: 8px 12px; border-radius: 8px; }
+        .mobile-nav { position: fixed; top: 0; right: 0; height: 100vh; width: 280px; background: #fff; transform: translateX(110%); transition: transform 0.28s ease; z-index: 1500; box-shadow: -12px 0 30px rgba(0,0,0,0.12); padding: 70px 20px; display: flex; flex-direction: column; gap: 14px; }
+        .mobile-nav.open { transform: translateX(0); }
+        .mobile-nav a { color: #111; font-weight: 700; padding: 14px 6px; border-bottom: 1px solid #f2f2f2; font-size: 1.05rem; }
+        .mobile-close { position: absolute; top: 14px; right: 14px; background: transparent; border: none; font-size: 1.1rem; cursor: pointer; }
+        .mobile-nav a:active, .mobile-nav a:focus { background: #f9f9f9; }
+
+        /* Improve tap target sizes */
+        .filter-btn, .btn, .project-card { touch-action: manipulation; }
+        .filter-btn, .filter-btn.active { padding: 12px 20px; }
+
+        @media (max-width: 992px) {
+            section { padding: 80px clamp(16px, 4vw, 48px); }
+        }
+
+        @media (max-width: 768px) {
+            #mobile-nav-toggle { display: inline-block; color: #111; }
+            nav { padding: 10px 5%; }
+            .nav-links { display: none; }
+            .hero-title { font-size: 2.2rem; }
+            .hero-stats { flex-direction: column; gap: 20px; }
+            .methodology-wrapper { grid-template-columns: 1fr; }
+            .method-steps { padding-left: 0; }
+            .massive-grid:not(.mobile-main-scroll) { column-count: 2; column-gap: 12px; column-fill: auto; display: block; }
+            .waterfall-grid { /* 4-col handled by JS */ }
+            .project-thumb { height: 170px; }
+            .hero-tag { padding: 6px 12px; font-size: 0.78rem; }
+            .hero-title .highlight { display: inline-block; }
+            .hero-stats .stat-item h3 { font-size: 2.4rem; }
+            .massive-grid.mobile-main-scroll {
+                --mobile-card-width: clamp(132px, 42vw, 178px);
+                --mobile-info-height: 76px;
+                --mobile-card-height: calc((var(--mobile-card-width) / 2) + var(--mobile-info-height));
+                grid-auto-flow: column;
+                grid-template-columns: none;
+                grid-template-rows: repeat(4, var(--mobile-card-height));
+                grid-auto-columns: minmax(var(--mobile-card-width), var(--mobile-card-width));
+                gap: 10px;
+                overflow-x: auto;
+                overflow-y: hidden;
+                padding: 2px 2px 10px;
+                scroll-snap-type: none;
+                scroll-behavior: smooth;
+                -webkit-overflow-scrolling: touch;
+                overscroll-behavior-x: contain;
+                scrollbar-width: thin;
+                align-items: stretch;
+                align-content: start;
+                justify-content: start;
+                justify-items: stretch;
+            }
+            .massive-grid.mobile-main-scroll > .project-card {
+                width: var(--mobile-card-width);
+                height: var(--mobile-card-height);
+                min-width: 0;
+                min-height: var(--mobile-card-height);
+                max-width: var(--mobile-card-width);
+                display: flex;
+                flex-direction: column;
+                aspect-ratio: auto;
+                overflow: hidden;
+                margin: 0;
+            }
+            .massive-grid.mobile-main-scroll .project-thumb {
+                height: auto;
+                aspect-ratio: 2 / 1;
+                flex: 0 0 auto;
+            }
+            .massive-grid.mobile-main-scroll .project-thumb img,
+            .massive-grid.mobile-main-scroll .project-thumb video {
+                height: 100%;
+                object-fit: cover;
+            }
+            .massive-grid.mobile-main-scroll .project-info {
+                height: var(--mobile-info-height);
+                padding: 7px 8px;
+                min-height: 0;
+                overflow: hidden;
+                flex: 0 0 var(--mobile-info-height);
+                display: flex;
+                flex-direction: column;
+                gap: 2px;
+            }
+            .massive-grid.mobile-main-scroll .project-info h4 {
+                font-size: 0.82rem;
+                line-height: 1.2;
+                margin-bottom: 0;
+                display: -webkit-box;
+                -webkit-line-clamp: 2;
+                -webkit-box-orient: vertical;
+                overflow: hidden;
+                min-height: calc(1.2em * 2);
+            }
+            .massive-grid.mobile-main-scroll .project-info span,
+            .massive-grid.mobile-main-scroll .project-card .gallery-hint {
+                font-size: 0.62rem;
+                display: block;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .massive-grid.mobile-main-scroll .project-info span {
+                line-height: 1.25;
+                min-height: 1.25em;
+                white-space: nowrap;
+            }
+            .massive-grid.mobile-main-scroll .project-card .gallery-hint {
+                margin-top: auto;
+                padding-top: 2px;
+                line-height: 1.15;
+                white-space: nowrap;
+            }
+            .work-pagination { display: none !important; }
+        }
+
+        @media (max-width: 480px) {
+            .massive-grid:not(.mobile-main-scroll) {
+                display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 10px;
+            }
+            .waterfall-grid { /* 2-col handled by JS */ }
+            .project-card { width: 100%; }
+            .project-thumb { height: auto; aspect-ratio: auto; }
+            .project-info { padding: 8px; }
+            .project-info h4 { font-size: 0.8rem; }
+            .project-info span { font-size: 0.64rem; }
+            .project-card .gallery-hint { font-size: 0.6rem; }
+            #works .section-subtitle { font-size: 0.82rem; line-height: 1.45; }
+            #amazon-rank .section-subtitle,
+            #ai-power .section-subtitle,
+            #methodology .section-subtitle,
+            #contact .section-subtitle {
+                font-size: 0.72rem;
+                line-height: 1.45;
+            }
+            .hero-title { font-size: 1.6rem; }
+            .hero-title .highlight { font-size: 1.05rem; }
+            .hero-stats .stat-item h3 { font-size: 1.8rem; }
+            .ai-stats { grid-template-columns: 1fr; gap: 18px; }
+            .tech-stack { margin-top: 34px; }
+            .tech-stack p,
+            .software-stack p {
+                font-size: 0.72rem;
+                margin-bottom: 10px;
+                letter-spacing: 0.06em;
+            }
+            .tech-stack span,
+            .software-stack span {
+                font-size: 0.7rem;
+                padding: 5px 12px;
+                margin: 0 6px 8px;
+                border-radius: 18px;
+                border-width: 1px;
+                box-shadow: 0 1px 6px rgba(0, 0, 0, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.18);
+            }
+            .software-stack {
+                padding: 16px 12px 12px;
+            }
+            .chart-container { padding: 10px; }
+            .chart-preview {
+                width: calc(100% + 8px);
+                margin-left: -4px;
+                padding: 0;
+            }
+            .methodology-wrapper {
+                padding: 8px;
+                gap: 10px;
+            }
+            .method-chart {
+                width: 100%;
+                min-height: 0;
+                padding: 0;
+                border-width: 1px;
+            }
+            .method-chart img {
+                width: 100%;
+                max-width: none;
+                height: auto;
+                display: block;
+            }
+            .method-steps {
+                padding-left: 0;
+                margin-top: 2px;
+            }
+            .method-steps li {
+                padding-left: 18px;
+                margin-bottom: 10px;
+                font-size: 0.82rem;
+                line-height: 1.45;
+            }
+            .btn { padding: 14px 28px; font-size: 1rem; }
+            .nav-links a { margin-left: 14px; }
+            #contact .container { text-align: center; }
+            #contact .section-title, #contact .section-subtitle { text-align: center; }
+            .contact-card { flex-direction: column; justify-content: center; align-items: center; gap: 14px; }
+            .contact-info { text-align: center; }
+            .contact-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
+            .contact-actions a { margin-right: 0; }
+            .lightbox-content { max-width: 94vw; max-height: 92vh; }
+            .lightbox-scroll-area { padding: 0; }
+            .lightbox-caption { padding: 10px 12px 14px; }
+        }
+
+        /* === 编辑模式提示 === */
+        #edit-mode-indicator {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: #ff9900;
+            color: #000;
+            padding: 10px 20px;
+            border-radius: 5px;
+            font-weight: bold;
+            z-index: 9999;
+            display: none;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.2);
+        }
+    </style>
+</head>
+<body>
+
+    <!-- 导航栏 -->
+    <nav>
+        <div class="logo" id="logo-trigger"><span class="brand-orange">PANGYU.</span><span class="brand-black">DESIGN</span></div>
+        <div class="nav-links">
+            <a href="#home">首页</a>
+            <a href="#works">作品展示</a>
+            <a href="#amazon-rank">百强战绩</a>
+            <a href="#ai-power">AI赋能</a>
+            <a href="#methodology">方法论</a>
+            <a href="#contact">联系</a>
+        </div>
+        <button id="mobile-nav-toggle" aria-label="打开导航">☰</button>
+        <div class="mobile-nav" id="mobileNav" aria-hidden="true">
+            <button class="mobile-close" id="mobileNavClose" aria-label="关闭导航">✕</button>
+            <a href="#home">首页</a>
+            <a href="#works">作品展示</a>
+            <a href="#amazon-rank">百强战绩</a>
+            <a href="#ai-power">AI赋能</a>
+            <a href="#methodology">方法论</a>
+            <a href="#contact">联系</a>
+        </div>
+    </nav>
+
+    <!-- 1. 首页 Hero -->
+    <section id="home">
+        <div>
+            <span class="hero-tag">全链路跨境品牌视觉专家</span>
+            <h1 class="hero-title"># 用视觉驱动<br><span class="highlight">35+ 亚马逊百强爆款</span></h1>
+            <p style="font-size: 1.2rem; opacity: 0.9;">从站内转化到站外裂变，从产品主图到 CES 展会落地</p>
+            <div class="hero-stats">
+                <div class="stat-item"><h3 class="count-up" data-target="35" data-suffix="+">0</h3><p>Amazon Best Sellers</p></div>
+                <div class="stat-item"><h3 class="count-up" data-target="170" data-suffix="+">0</h3><p>服务跨境产品项目</p></div>
+                <div class="stat-item"><h3 class="count-up" data-target="3500" data-suffix="+">0</h3><p>精品图片设计（非A+）</p></div>
+            </div>
+            <div class="amazon-badge" aria-hidden="true" title="亚马逊"> 
+                <img {...getCatalogImageAttrs('/1shouye/1ya.png', imageSizes.heroBadge, 'eager')} alt="" />
+            </div>
+        </div>
+    </section>
+
+    <!-- 2. 作品展示 -->
+    <section id="works">
+        <div class="container">
+            <h2 class="section-title">产品<span class="highlight">作品展示</span></h2>
+            <p class="section-subtitle">涵盖亚马逊主图、旗舰店、独立站及社媒热点，专注 3C/智能硬件/小家电</p>
+            <div class="works-toolbar">
+                <div class="works-search" role="search" aria-label="作品搜索">
+                    <span class="works-search-icon" aria-hidden="true">⌕</span>
+                    <input id="worksSearchInput" class="works-search-input" type="search" placeholder="搜索作品名、品类、关键词，例如 Drone / 主图 / Air Fryer" autocomplete="off" />
+                    <button id="worksSearchClear" class="works-search-clear" type="button" aria-label="清空搜索">×</button>
+                </div>
+                <div class="works-search-meta">
+                    <div class="works-search-stat" id="worksSearchStat">已显示全部作品</div>
+                    <div class="works-hotkeys" aria-label="快速搜索关键词">
+                        <button class="works-hotkey" type="button" data-search-keyword="Drone">Drone</button>
+                        <button class="works-hotkey" type="button" data-search-keyword="Robot Vacuum">Robot Vacuum</button>
+                        <button class="works-hotkey" type="button" data-search-keyword="Ice Maker">Ice Maker</button>
+                        <button class="works-hotkey" type="button" data-search-keyword="Mirror Dash Cam">Mirror Dash Cam</button>
+                        <button class="works-hotkey" type="button" data-search-keyword="Projector">Projector</button>
+                    </div>
+                </div>
+            </div>
+            <div class="filter-tabs-shell">
+                <div class="filter-scroll-tip" aria-hidden="true">
+                    <span>左右滑动查看更多分类</span>
+                    <div class="filter-scroll-track"></div>
+                </div>
+                <div class="filter-tabs">
+                    <button class="filter-btn active" type="button" data-filter="waterfall">瀑布图集</button>
+                    <button class="filter-btn" type="button" data-filter="main">亚马逊主图</button>
+                    <button class="filter-btn" type="button" data-filter="aplus">旗舰店/官网</button>
+                    <button class="filter-btn" type="button" data-filter="video">社媒/视频</button>
+                    <button class="filter-btn" type="button" data-filter="brand">品牌全案</button>
+                    <button class="filter-btn" type="button" data-filter="packaging">包装/配色</button>
+                    <button class="filter-btn" type="button" data-filter="ces">CES/线下</button>
+                    <button class="filter-btn" type="button" data-filter="other">其他</button>
+                </div>
+            </div>
+            <div class="waterfall-panel" id="waterfallPanel">
+                <div class="waterfall-grid" id="waterfallGrid">
+                {waterfallImages.map((image, i) => (
+                    <figure class="waterfall-item" data-folder={image.folderLabel} data-wf-index={i}>
+                        <div class="waterfall-block">
+                            {image.type === 'video' ? (
+                                <video class="waterfall-preview-video" autoplay muted loop playsinline preload="metadata" aria-label={image.alt}>
+                                    <source src={image.src} type={image.mimeType || 'video/mp4'} />
+                                </video>
+                            ) : (
+                                <img {...getCatalogImageAttrs(image.src, imageSizes.waterfall)} alt={image.alt} />
+                            )}
+                        </div>
+                    </figure>
+                ))}
+                </div>
+                <div class="waterfall-more-wrap" id="waterfallMoreWrap">
+                    <button class="waterfall-more-btn" id="waterfallMoreBtn" type="button">显示更多</button>
+                </div>
+                <div class="waterfall-done-wrap" id="waterfallDoneWrap">
+                    <span class="waterfall-done-label">— 已展示全部图集 —</span>
+                    <button class="waterfall-back-btn" id="waterfallBackBtn" type="button">&#8679; 返回开始</button>
+                </div>
+            </div>
+            <div class="massive-grid-wrap" id="workGridWrap">
+                <div class="massive-grid" id="workGrid">
+                {mainProjectCards.map((card) => (
+                    <div class="project-card" data-type="main" data-source="directory" data-images={JSON.stringify(card.images)} data-videos={JSON.stringify(card.videos)}>
+                        <div class="project-thumb">
+                            {card.previewVideoSrc ? (
+                                <>
+                                    <video class="project-preview-video" autoplay muted loop playsinline preload="metadata" poster={card.coverSrc || undefined} aria-label={`${card.folderName} 主图视频预览`}>
+                                        <source src={card.previewVideoSrc} type={card.previewVideoMime || 'video/mp4'} />
+                                    </video>
+                                    {card.coverSrc && <img class="video-fallback-image" {...getCatalogImageAttrs(card.coverSrc, imageSizes.card)} alt={`${card.folderName} 封面图`} />}
+                                </>
+                            ) : (
+                                <img {...getCatalogImageAttrs(card.coverSrc, imageSizes.card)} alt={`${card.folderName} 封面图`} />
+                            )}
+                        </div>
+                        <div class="project-info"><h4>{card.folderName}</h4><span>亚马逊主图 / {card.imageCount} 张详情图</span><div class="gallery-hint">点击查看更多</div></div>
+                        <div class="project-gallery"></div>
+                    </div>
+                ))}
+                {aplusProjectCards.map((card) => (
+                    <div class="project-card" data-type="aplus" data-source="directory" data-images={JSON.stringify(card.images)} data-videos={JSON.stringify(card.videos)}>
+                        <div class="project-thumb"><img {...getCatalogImageAttrs(card.coverSrc, imageSizes.card)} alt={`${card.folderName} 封面图`}></div>
+                        <div class="project-info"><h4>{card.folderName}</h4><span>旗舰店/官网 / {card.imageCount} 张详情图</span><div class="gallery-hint">点击查看更多</div></div>
+                        <div class="project-gallery"></div>
+                    </div>
+                ))}
+                {socialProjectCards.map((card) => (
+                    <div class="project-card" data-type="video" data-source="directory" data-images={JSON.stringify(card.images)} data-videos={JSON.stringify(card.videos)}>
+                        <div class="project-thumb">
+                            {card.previewVideoSrc ? (
+                                <>
+                                    <video class="project-preview-video" autoplay muted loop playsinline preload="metadata" poster={card.coverSrc || undefined} aria-label={`${card.folderName} 社媒视频预览`}>
+                                        <source src={card.previewVideoSrc} type={card.previewVideoMime || 'video/mp4'} />
+                                    </video>
+                                    {card.coverSrc && <img class="video-fallback-image" {...getCatalogImageAttrs(card.coverSrc, imageSizes.card)} alt={`${card.folderName} 封面图`} />}
+                                </>
+                            ) : (
+                                <img {...getCatalogImageAttrs(card.coverSrc, imageSizes.card)} alt={`${card.folderName} 封面图`} />
+                            )}
+                        </div>
+                        <div class="project-info"><h4>{card.folderName}</h4><span>社媒/视频 / {card.imageCount} 张详情图</span><div class="gallery-hint">点击查看更多</div></div>
+                        <div class="project-gallery"></div>
+                    </div>
+                ))}
+                {brandProjectCards.map((card) => (
+                    <div class="project-card" data-type="brand" data-source="directory" data-images={JSON.stringify(card.images)} data-videos={JSON.stringify(card.videos)}>
+                        <div class="project-thumb">
+                            {card.previewVideoSrc ? (
+                                <>
+                                    <video class="project-preview-video" autoplay muted loop playsinline preload="metadata" poster={card.images[0] || undefined} aria-label={`${card.folderName} 品牌全案视频预览`}>
+                                        <source src={card.previewVideoSrc} type={card.previewVideoMime || 'video/mp4'} />
+                                    </video>
+                                    {card.images[0] && <img class="video-fallback-image" {...getCatalogImageAttrs(card.images[0], imageSizes.card)} alt={`${card.folderName} 封面图`} />}
+                                </>
+                            ) : (
+                                <img {...getCatalogImageAttrs(card.coverSrc, imageSizes.card)} alt={`${card.folderName} 封面图`} />
+                            )}
+                        </div>
+                        <div class="project-info"><h4>{card.folderName}</h4><span>品牌全案 / {card.imageCount} 张详情图</span><div class="gallery-hint">点击查看更多</div></div>
+                        <div class="project-gallery"></div>
+                    </div>
+                ))}
+                {packagingProjectCards.map((card) => (
+                    <div class="project-card" data-type="packaging" data-source="directory" data-images={JSON.stringify(card.images)} data-videos={JSON.stringify(card.videos)}>
+                        <div class="project-thumb">
+                            {card.previewVideoSrc ? (
+                                <>
+                                    <video class="project-preview-video" autoplay muted loop playsinline preload="metadata" poster={card.images[0] || undefined} aria-label={`${card.folderName} 包装配色视频预览`}>
+                                        <source src={card.previewVideoSrc} type={card.previewVideoMime || 'video/mp4'} />
+                                    </video>
+                                    {card.images[0] && <img class="video-fallback-image" {...getCatalogImageAttrs(card.images[0], imageSizes.card)} alt={`${card.folderName} 封面图`} />}
+                                </>
+                            ) : (
+                                <img {...getCatalogImageAttrs(card.coverSrc, imageSizes.card)} alt={`${card.folderName} 封面图`}>
+                            )}
+                        </div>
+                        <div class="project-info"><h4>{card.folderName}</h4><span>包装/配色 / {card.imageCount} 张详情图</span><div class="gallery-hint">点击查看更多</div></div>
+                        <div class="project-gallery"></div>
+                    </div>
+                ))}
+                {cesProjectCards.map((card) => (
+                    <div class="project-card" data-type="ces" data-source="directory" data-images={JSON.stringify(card.images)} data-videos={JSON.stringify(card.videos)}>
+                        <div class="project-thumb"><img {...getCatalogImageAttrs(card.coverSrc, imageSizes.card)} alt={`${card.folderName} 封面图`}></div>
+                        <div class="project-info"><h4>{card.folderName}</h4><span>CES/线下 / {card.imageCount} 张详情图</span><div class="gallery-hint">点击查看更多</div></div>
+                        <div class="project-gallery"></div>
+                    </div>
+                ))}
+                {otherProjectCards.map((card) => (
+                    <div class="project-card" data-type="other" data-source="directory" data-images={JSON.stringify(card.images)} data-videos={JSON.stringify(card.videos)}>
+                        <div class="project-thumb">
+                            {card.previewVideoSrc ? (
+                                <>
+                                    <video class="project-preview-video" autoplay muted loop playsinline preload="metadata" poster={card.images[0] || undefined} aria-label={`${card.folderName} 其他栏目视频预览`}>
+                                        <source src={card.previewVideoSrc} type={card.previewVideoMime || 'video/mp4'} />
+                                    </video>
+                                    {card.images[0] && <img class="video-fallback-image" {...getCatalogImageAttrs(card.images[0], imageSizes.card)} alt={`${card.folderName} 封面图`} />}
+                                </>
+                            ) : (
+                                <img {...getCatalogImageAttrs(card.coverSrc, imageSizes.card)} alt={`${card.folderName} 封面图`} />
+                            )}
+                        </div>
+                        <div class="project-info"><h4>{card.folderName}</h4><span>其他 / {card.imageCount} 张详情图</span><div class="gallery-hint">点击查看更多</div></div>
+                        <div class="project-gallery"></div>
+                    </div>
+                ))}
+                </div>
+                <div class="work-pagination" id="workPagination" hidden>
+                    <button class="page-nav prev" type="button" aria-label="上一页">上一页</button>
+                    <div class="page-number-list" id="workPageNumbers" aria-label="分页数字"></div>
+                    <div class="page-visual" id="workPageVisual" aria-label="分页可视化导航"></div>
+                    <button class="page-nav next" type="button" aria-label="下一页">下一页</button>
+                </div>
+                <div class="works-no-results" id="worksNoResults">
+                    没有找到匹配的作品，试试 <strong>Drone</strong>、<strong>主图</strong> 或 <strong>Air Fryer</strong>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- 3. 亚马逊百强战绩 -->
+    <section id="amazon-rank">
+        <div class="container">
+            <h2 class="section-title">亚马逊百强<span class="highlight">战绩墙</span></h2>
+            <p class="section-subtitle">由本人独立完成视觉设计的超<strong style="color: #e74c3c;">10款产品</strong>，成功跻身 Best Sellers 榜单。<span style="color: #ff9900; margin-left: 6px;">（同一时期）</span></p>
+            <div class="chart-container">
+                <div class="chart-preview" id="chartPreview" data-image="/1shouye/ms.png">
+                    <img {...getCatalogImageAttrs('/1shouye/ms.png', imageSizes.methodology)} alt="亚马逊百强战绩墙数据看板" />
+                </div>
+                <div style="margin-top: 30px;">
+                    <h4 style="margin-bottom: 15px; color: #333; border-left: 4px solid #ff9900; padding-left: 10px;">核心爆款案例</h4>
+                    <ul style="list-style: none; padding-left: 0;">
+                        <li class="rank-item" data-images={JSON.stringify(h5cDrone2RankImages)}><div><strong>无人机 S5C</strong> - Multirotors</div><span class="rank-num">#1</span><div class="rank-gallery"></div></li>
+                        <li class="rank-item" data-images={JSON.stringify(a15hDroneRankImages)}><div><strong>无人机 A15</strong> - Multirotors</div><span class="rank-num">#6</span><div class="rank-gallery"></div></li>
+                        <li class="rank-item" data-images={JSON.stringify(h823hBlueRankImages)}><div><strong>无人机 H823H</strong> - Multirotors</div><span class="rank-num">#8</span><div class="rank-gallery"></div></li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- 4. AI 赋能提效 -->
+    <section id="ai-power">
+        <div class="container">
+            <h2 class="section-title" style="color:#fff;">AI 赋能与<span class="highlight">设计提效</span></h2>
+            <p class="section-subtitle">全面拥抱生成式 AI 工作流，重塑视觉生产力，实现降本增效与创意爆发</p>
+            <div class="ai-stats">
+                <div class="ai-stat-box"><h3>Top 1%</h3><p>基于大数据优选的高点击率视觉方案</p></div>
+                <div class="ai-stat-box"><h3>≈ 3-5 人</h3><p>等效替代初级设计师月度工作量</p></div>
+                <div class="ai-stat-box"><h3 class="count-up" data-target="90" data-suffix="%">0</h3><p>削减传统寄样、搭棚、拍摄、3D 建模流程视觉制作预算</p></div>
+            </div>
+            <div class="tech-stack">
+                <p>技术栈</p>
+                <span>Lovart</span>
+                <span>Photoshop AI</span>
+                <span>即梦</span>
+                <span>Seedance</span>
+                <span>GPT</span>
+                <span>Nano Banana Pro</span>
+                <span>千问</span>
+                <span>Krea AI</span>
+                <span>DeepSeek</span>
+                <span>Midjourney</span>
+            </div>
+        </div>
+    </section>
+
+    <section id="software-tools">
+        <div class="software-stack">
+            <p>使用软件</p>
+            <span>Cinema 4D</span>
+            <span>Arnold</span>
+            <span>Photoshop</span>
+            <span>illustrator</span>
+            <span>KeyShot</span>
+            <span>PureRef</span>
+            <span>Xmind</span>
+            <span>Topaz Photo AI</span>
+            <span>VS Code</span>
+        </div>
+    </section>
+
+    <!-- 5. 设计方法论 -->
+    <section id="methodology">
+        <div class="container">
+            <h2 class="section-title">我的<span class="highlight">设计方法论</span></h2>
+            <p class="section-subtitle">基于<span style="color:#ff9900; font-weight:700;">马斯洛需求层次理论</span>和<span style="color:#ff9900; font-weight:700;">跨境电商实战经验总结</span>的视觉转化体系，用视觉设计去满足用户不同层级的心理需求，从而提升转化率。<span style="color:#e53935; font-weight:700;">（59p PPT分析）</span></p>
+            <div class="methodology-wrapper">
+                <div class="method-chart" id="methodChart" data-image="/1shouye/2suo.png">
+                    <img {...getCatalogImageAttrs('/1shouye/methodology-reference.png', imageSizes.methodology)} alt="方法论层级图" />
+                </div>
+                <ul class="method-steps">
+                    <li><strong>锚定需求层：</strong>看准客户处于哪一级的心理需求。</li>
+                    <li><strong>痛点可视化：</strong>把抽象的焦虑变成直观的视觉。</li>
+                    <li><strong>场景造共鸣：</strong>用真实生活场景拉近客户距离。</li>
+                    <li><strong>拉升价值感：</strong>用高级质感赋予产品高溢价。</li>
+                    <li><strong>传递生活观：</strong>用美学表达理想的生活方式。</li>
+                </ul>
+            </div>
+        </div>
+    </section>
+
+    <!-- 6. 联系 -->
+    <section id="contact">
+        <div class="container">
+            <h2 class="section-title" style="color:#fff;">与我<span class="highlight">联系</span></h2>
+            <p class="section-subtitle" style="color:#aaa;">期待与您合作，共同打造下一个跨境爆款产品。</p>
+            <div class="contact-card">
+                <div style="position:relative; display:inline-block;">
+                    <div class="contact-avatar" id="contactAvatarWrap">
+                        <img id="contactAvatar" {...getCatalogImageAttrs('/tex/toux.jpg', imageSizes.avatar, 'eager')} alt="头像">
+                    </div>
+                    <div class="contact-status" aria-hidden="true"><span class="dot"></span><span class="text">可任职</span></div>
+                </div>
+                <div class="contact-info">
+                    <h3>联系信息</h3>
+                    <p>WeChat: <strong>YIYUANYUYU</strong></p>
+                    <p>Email: <a href="mailto:312675265@qq.com" style="color:#fff; text-decoration:underline;">312675265@qq.com</a></p>
+                    <div class="contact-actions">
+                        <a href="#" id="copyEmail">复制Email</a>
+                        <a href="#" id="copyWeChat">复制 WeChat</a>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- 编辑模式指示器 -->
+    <div id="edit-mode-indicator">编辑模式已开启</div>
+
+    <div class="lightbox-overlay" id="lightboxOverlay">
+        <div class="lightbox-content">
+            <button class="lightbox-close" id="lightboxClose" aria-label="关闭">×</button>
+            <button class="lightbox-nav prev" id="lightboxPrev" aria-label="上一张">‹</button>
+            <div class="lightbox-scroll-area">
+                <div class="lightbox-gallery" id="lightboxGallery"></div>
+            </div>
+            <button class="lightbox-nav next" id="lightboxNext" aria-label="下一张">›</button>
+            <div class="lightbox-caption" id="lightboxCaption"></div>
+        </div>
+    </div>
+
+    <div id="responsive-image-catalog" data-json={encodeURIComponent(JSON.stringify(runtimeResponsiveImageCatalog))} hidden></div>
+
+    <script>
+        const runtimeResponsiveImageCatalogElement = document.getElementById('responsive-image-catalog');
+        const runtimeResponsiveImageCatalog = runtimeResponsiveImageCatalogElement instanceof HTMLElement && runtimeResponsiveImageCatalogElement.dataset.json
+            ? JSON.parse(decodeURIComponent(runtimeResponsiveImageCatalogElement.dataset.json))
+            : {};
+
+        function getRuntimeResponsiveImageData(src: string) {
+            if (runtimeResponsiveImageCatalog[src]) {
+                return runtimeResponsiveImageCatalog[src];
+            }
+
+            if (/^https?:\/\/images\.unsplash\.com\//i.test(src)) {
+                const url = new URL(src);
+                const originalWidth = Number(url.searchParams.get('w') || '1600');
+                const widths = [240, 360, 480, 640, 960, 1280].filter((width) => width < originalWidth);
+                return {
+                    src,
+                    srcset: [...widths, originalWidth].map((width) => {
+                        const variant = new URL(url.toString());
+                        variant.searchParams.set('w', String(width));
+                        return `${variant.toString()} ${width}w`;
+                    }).join(', '),
+                    width: originalWidth,
+                };
+            }
+
+            if (/^https?:\/\/placehold\.co\//i.test(src)) {
+                const url = new URL(src);
+                const match = url.pathname.match(/\/(\d+)x(\d+)(?=\/|$)/i);
+                if (match) {
+                    const originalWidth = Number(match[1]);
+                    const originalHeight = Number(match[2]);
+                    const widths = [240, 360, 480, 640, 960, 1280].filter((width) => width < originalWidth);
+                    return {
+                        src,
+                        srcset: [...widths, originalWidth].map((width) => {
+                            const height = Math.round((originalHeight / originalWidth) * width);
+                            return `${src.replace(`/${originalWidth}x${originalHeight}/`, `/${width}x${height}/`)} ${width}w`;
+                        }).join(', '),
+                        width: originalWidth,
+                        height: originalHeight,
+                    };
+                }
+            }
+
+            return { src };
+        }
+
+        function getResponsiveImageTagAttributes(src: string, sizes = '100vw') {
+            const data = getRuntimeResponsiveImageData(src);
+            const attrs = [
+                `src="${data.src}"`,
+                `sizes="${sizes}"`,
+                `loading="lazy"`,
+                `decoding="async"`,
+            ];
+
+            if (data.srcset) attrs.push(`srcset="${data.srcset}"`);
+            if (data.width) attrs.push(`width="${data.width}"`);
+            if (data.height) attrs.push(`height="${data.height}"`);
+
+            return attrs.join(' ');
+        }
+
+        // === 导航条滚动隐藏/显示 ===
+        const navElement = document.querySelector('nav');
+        let lastScrollY = 0;
+        let isNavHidden = false;
+        let scrollTimeout: ReturnType<typeof setTimeout> | null = null;
+
+        window.addEventListener('scroll', () => {
+            const currentScrollY = window.scrollY;
+            const isScrollingDown = currentScrollY > lastScrollY;
+
+            if (scrollTimeout) clearTimeout(scrollTimeout);
+
+            if (isScrollingDown && currentScrollY > 100) {
+                // 向下滚动且滚动距离超过100px时，隐藏导航条
+                if (!isNavHidden && navElement) {
+                    navElement.classList.add('nav-hidden');
+                    isNavHidden = true;
+                }
+            } else if (currentScrollY < 100 || !isScrollingDown) {
+                // 向上滚动或回到顶部时，显示导航条
+                if (isNavHidden && navElement) {
+                    navElement.classList.remove('nav-hidden');
+                    isNavHidden = false;
+                }
+            }
+
+            // 停止滚动后延迟显示
+            scrollTimeout = setTimeout(() => {
+                if (navElement && isNavHidden) {
+                    navElement.classList.remove('nav-hidden');
+                    isNavHidden = false;
+                }
+            }, 1200);
+
+            lastScrollY = currentScrollY;
+        }, { passive: true });
+
+        // === 平滑滚动 ===
+        document.querySelectorAll<HTMLAnchorElement>('a[href^="#"]').forEach(anchor => {
+            anchor.addEventListener('click', function (e) {
+                e.preventDefault();
+                const href = anchor.getAttribute('href');
+                const target = href ? document.querySelector<HTMLElement>(href) : null;
+                if (target) {
+                    target.scrollIntoView({ behavior: 'smooth' });
+                }
+            });
+        });
+
+        // === 作品过滤与瀑布图集 ===
+        const workGridWrap = document.getElementById('workGridWrap');
+        const worksSection = document.getElementById('works');
+        const workGrid = document.getElementById('workGrid');
+        const workPagination = document.getElementById('workPagination');
+        const workPageNumbers = document.getElementById('workPageNumbers');
+        const workPageVisual = document.getElementById('workPageVisual');
+        const paginationPrevBtn = workPagination?.querySelector<HTMLButtonElement>('.page-nav.prev');
+        const paginationNextBtn = workPagination?.querySelector<HTMLButtonElement>('.page-nav.next');
+        const waterfallPanel = document.getElementById('waterfallPanel');
+        const waterfallMoreBtn = document.getElementById('waterfallMoreBtn');
+        const waterfallMoreWrap = document.getElementById('waterfallMoreWrap');
+        const waterfallDoneWrap = document.getElementById('waterfallDoneWrap');
+        const WF_BATCH = 39;
+        let wfShownCount = WF_BATCH;
+
+        // === JS Masonry 布局 ===
+        function getWaterfallCols(): number {
+            const w = window.innerWidth;
+            if (w <= 480) return 2;
+            if (w <= 768) return 4;
+            return 5;
+        }
+
+        let _wfRaf = 0;
+        function scheduleWaterfallLayout() {
+            if (_wfRaf) cancelAnimationFrame(_wfRaf);
+            _wfRaf = requestAnimationFrame(() => {
+                _wfRaf = 0;
+                layoutWaterfall();
+            });
+        }
+
+        function layoutWaterfall() {
+            const grid = document.getElementById('waterfallGrid') as HTMLElement | null;
+            if (!grid) return;
+            const gridWidth = grid.offsetWidth;
+            if (!gridWidth) return;
+            const cols = getWaterfallCols();
+            const colW = Math.floor(gridWidth / cols);
+            const colH = new Array<number>(cols).fill(0);
+            const visibleItems = Array.from(
+                grid.querySelectorAll<HTMLElement>('.waterfall-item:not(.wf-hidden)')
+            );
+            visibleItems.forEach((item) => {
+                item.style.width = colW + 'px';
+                let col = 0;
+                for (let c = 1; c < cols; c++) {
+                    if (colH[c] < colH[col]) col = c;
+                }
+                item.style.left = col * colW + 'px';
+                item.style.top  = colH[col] + 'px';
+                colH[col] += item.offsetHeight;
+            });
+            grid.style.height = Math.max(...colH) + 'px';
+        }
+
+        function attachWaterfallImageListeners() {
+            const grid = document.getElementById('waterfallGrid');
+            if (!grid) return;
+
+            grid.querySelectorAll<HTMLImageElement>('img').forEach((img) => {
+                if (!img.complete && !img.dataset.wfL) {
+                    img.dataset.wfL = '1';
+                    img.addEventListener('load',  scheduleWaterfallLayout, { once: true });
+                    img.addEventListener('error', scheduleWaterfallLayout, { once: true });
+                }
+            });
+
+            grid.querySelectorAll<HTMLElement>('.waterfall-block').forEach((block) => {
+                if (block.dataset.wfPreviewBound === '1') return;
+                block.dataset.wfPreviewBound = '1';
+                block.addEventListener('click', () => {
+                    const mediaNode = block.querySelector<HTMLImageElement | HTMLVideoElement>('img, video');
+                    if (!mediaNode) return;
+
+                    const mediaType = mediaNode instanceof HTMLVideoElement ? 'video' : 'image';
+                    const mediaSrc = mediaNode instanceof HTMLVideoElement
+                        ? (mediaNode.currentSrc || mediaNode.querySelector('source')?.getAttribute('src') || '')
+                        : mediaNode.currentSrc || mediaNode.src;
+
+                    if (!mediaSrc) return;
+
+                    const isSameItemOpen = overlay?.classList.contains('active') &&
+                        currentLightboxMedia.length === 1 &&
+                        currentLightboxMedia[0].type === mediaType &&
+                        currentLightboxMedia[0].src === mediaSrc;
+
+                    if (isSameItemOpen) {
+                        closeLightbox();
+                        return;
+                    }
+
+                    openLightbox([{ type: mediaType, src: mediaSrc }], 0);
+                });
+            });
+        }
+
+        let _wfResizeTimer = 0;
+        window.addEventListener('resize', () => {
+            clearTimeout(_wfResizeTimer);
+            _wfResizeTimer = window.setTimeout(scheduleWaterfallLayout, 100);
+        });
+
+        function setWaterfallDoneState(allShown: boolean) {
+            if (waterfallMoreWrap) waterfallMoreWrap.classList.toggle('wf-all-shown', allShown);
+            if (waterfallDoneWrap) waterfallDoneWrap.classList.toggle('wf-all-shown', allShown);
+        }
+
+        function initWaterfallLoadMore() {
+            const items = waterfallPanel?.querySelectorAll<HTMLElement>('.waterfall-item') ?? [];
+            const total = items.length;
+            items.forEach((item, idx) => {
+                item.classList.toggle('wf-hidden', idx >= WF_BATCH);
+            });
+            wfShownCount = Math.min(WF_BATCH, total);
+            setWaterfallDoneState(total <= WF_BATCH);
+            attachWaterfallImageListeners();
+            scheduleWaterfallLayout();
+        }
+
+        function resetWaterfallLoadMore() {
+            initWaterfallLoadMore();
+        }
+
+        waterfallMoreBtn?.addEventListener('click', () => {
+            const items = waterfallPanel?.querySelectorAll<HTMLElement>('.waterfall-item') ?? [];
+            const total = items.length;
+            const newCount = Math.min(wfShownCount + WF_BATCH, total);
+            for (let i = wfShownCount; i < newCount; i++) {
+                items[i]?.classList.remove('wf-hidden');
+            }
+            wfShownCount = newCount;
+            setWaterfallDoneState(wfShownCount >= total);
+            attachWaterfallImageListeners();
+            scheduleWaterfallLayout();
+        });
+
+        const waterfallBackBtn = document.getElementById('waterfallBackBtn');
+        waterfallBackBtn?.addEventListener('click', () => {
+            resetWaterfallLoadMore();
+            waterfallPanel?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        });
+
+        initWaterfallLoadMore();
+
+        const mainCardsPerPage = 32;
+        const mobileUnifiedFilters = new Set(['main', 'aplus', 'video', 'brand', 'packaging', 'ces', 'other']);
+        let currentFilter = 'waterfall';
+        let currentSearchQuery = '';
+        let currentMainPage = 1;
+        let visibleMainCards: HTMLElement[] = [];
+        const worksSearchInput = document.getElementById('worksSearchInput') as HTMLInputElement | null;
+        const worksSearchClear = document.getElementById('worksSearchClear');
+        const worksSearchStat = document.getElementById('worksSearchStat');
+        const worksNoResults = document.getElementById('worksNoResults');
+
+        function isDesktopViewport() {
+            return window.matchMedia('(min-width: 769px)').matches;
+        }
+
+        function isMobileViewport() {
+            return window.matchMedia('(max-width: 768px)').matches;
+        }
+
+        function normalizeSearchText(value: string) {
+            return value
+                .trim()
+                .normalize('NFKC')
+                .toLowerCase()
+                .replace(/[\s\p{P}\p{S}]+/gu, '');
+        }
+
+        function escapeHtml(value: string) {
+            return value
+                .replaceAll('&', '&amp;')
+                .replaceAll('<', '&lt;')
+                .replaceAll('>', '&gt;')
+                .replaceAll('"', '&quot;')
+                .replaceAll("'", '&#39;');
+        }
+
+        function getCardSearchText(card: HTMLElement) {
+            if (!card.dataset.searchText) {
+                const title = card.querySelector('h4')?.textContent || '';
+                const subtitle = card.querySelector('.project-info span')?.textContent || '';
+                const altText = Array.from(card.querySelectorAll('img')).map((img) => img.alt || '').join(' ');
+                card.dataset.searchText = normalizeSearchText([title, subtitle, altText, card.dataset.type || '', card.dataset.source || ''].join(' '));
+            }
+
+            return card.dataset.searchText || '';
+        }
+
+        function setCardTitleHighlight(card: HTMLElement, query: string) {
+            const title = card.querySelector('h4');
+            if (!title) return;
+
+            if (!title.dataset.originalText) {
+                title.dataset.originalText = title.textContent || '';
+            }
+
+            const originalText = title.dataset.originalText || '';
+            if (!query) {
+                title.innerHTML = escapeHtml(originalText);
+                return;
+            }
+
+            const lowerOriginal = originalText.toLowerCase();
+            const index = lowerOriginal.indexOf(query);
+            if (index < 0) {
+                title.innerHTML = escapeHtml(originalText);
+                return;
+            }
+
+            const before = originalText.slice(0, index);
+            const match = originalText.slice(index, index + query.length);
+            const after = originalText.slice(index + query.length);
+            title.innerHTML = `${escapeHtml(before)}<span class="search-match">${escapeHtml(match)}</span>${escapeHtml(after)}`;
+        }
+
+        function toggleMainMobileScrollLayout() {
+            if (!(workGrid instanceof HTMLElement)) return;
+            const shouldEnable = mobileUnifiedFilters.has(currentFilter) && isMobileViewport();
+            workGrid.classList.toggle('mobile-main-scroll', shouldEnable);
+        }
+
+        function updateMainPaginationUI(totalPages: number) {
+            if (!workPagination || !workPageNumbers || !workPageVisual) return;
+
+            workPageNumbers.innerHTML = '';
+            workPageVisual.innerHTML = '';
+
+            for (let page = 1; page <= totalPages; page++) {
+                const numberBtn = document.createElement('button');
+                numberBtn.type = 'button';
+                numberBtn.className = `page-number${page === currentMainPage ? ' active' : ''}`;
+                numberBtn.textContent = String(page);
+                numberBtn.setAttribute('aria-label', `跳转到第 ${page} 页`);
+                numberBtn.addEventListener('click', () => renderMainPage(page, true));
+                workPageNumbers.appendChild(numberBtn);
+
+                const visualBtn = document.createElement('button');
+                visualBtn.type = 'button';
+                visualBtn.className = `page-visual-dot${page === currentMainPage ? ' active' : ''}`;
+                visualBtn.setAttribute('aria-label', `可视化跳转到第 ${page} 页`);
+                visualBtn.addEventListener('click', () => renderMainPage(page, true));
+                workPageVisual.appendChild(visualBtn);
+            }
+
+            if (paginationPrevBtn) {
+                paginationPrevBtn.disabled = currentMainPage <= 1;
+            }
+            if (paginationNextBtn) {
+                paginationNextBtn.disabled = currentMainPage >= totalPages;
+            }
+        }
+
+        function renderMainPage(targetPage: number, scrollToTop = false) {
+            if (!visibleMainCards.length) {
+                if (workPagination) workPagination.hidden = true;
+                return;
+            }
+
+            if (!isDesktopViewport() || currentFilter !== 'main') {
+                visibleMainCards.forEach((card) => {
+                    card.style.removeProperty('display');
+                });
+                if (workPagination) workPagination.hidden = true;
+                return;
+            }
+
+            const totalPages = Math.max(1, Math.ceil(visibleMainCards.length / mainCardsPerPage));
+            currentMainPage = Math.min(Math.max(targetPage, 1), totalPages);
+            const start = (currentMainPage - 1) * mainCardsPerPage;
+            const end = start + mainCardsPerPage;
+
+            visibleMainCards.forEach((card, index) => {
+                if (index >= start && index < end) {
+                    card.style.removeProperty('display');
+                } else {
+                    card.style.display = 'none';
+                }
+            });
+
+            if (workPagination) {
+                workPagination.hidden = totalPages <= 1;
+            }
+            updateMainPaginationUI(totalPages);
+
+            if (scrollToTop) {
+                worksSection?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }
+        }
+
+        function refreshMainPagination(cards: HTMLElement[]) {
+            visibleMainCards = cards;
+            currentMainPage = 1;
+            renderMainPage(currentMainPage, false);
+        }
+
+        function setWaterfallMode(isWaterfall: boolean) {
+            if (workGridWrap) workGridWrap.style.display = isWaterfall ? 'none' : '';
+            if (waterfallPanel) waterfallPanel.classList.toggle('active', isWaterfall);
+            if (isWaterfall && workPagination) {
+                workPagination.hidden = true;
+            }
+            if (isWaterfall) {
+                resetWaterfallLoadMore();
+            }
+        }
+
+        function updateWorksSearchStatus(visibleCount: number, totalCount: number, isWaterfall = false) {
+            if (worksSearchStat) {
+                if (isWaterfall) {
+                    worksSearchStat.textContent = '当前为瀑布图集';
+                } else if (!currentSearchQuery) {
+                    worksSearchStat.textContent = `已显示全部作品 · ${visibleCount}/${totalCount}`;
+                } else {
+                    worksSearchStat.textContent = `找到 ${visibleCount}/${totalCount} 个结果`;
+                }
+            }
+
+            if (worksNoResults) {
+                worksNoResults.style.display = !currentSearchQuery || visibleCount > 0 ? 'none' : 'block';
+            }
+        }
+
+        function applyWorksFilterState() {
+            const cards = document.querySelectorAll<HTMLElement>('.project-card');
+            const normalizedQuery = normalizeSearchText(currentSearchQuery);
+            const filterType = normalizedQuery ? 'all' : currentFilter;
+            const isWaterfall = filterType === 'waterfall' && !normalizedQuery;
+
+            setWaterfallMode(isWaterfall);
+
+            if (isWaterfall) {
+                cards.forEach((card) => setCardTitleHighlight(card, ''));
+                updateWorksSearchStatus(0, 0, true);
+                return;
+            }
+
+            const visibleCards: HTMLElement[] = [];
+            const visibleDirectoryMainCards: HTMLElement[] = [];
+
+            cards.forEach((card) => {
+                const categoryMatches = filterType === 'all'
+                    ? true
+                    : card.dataset.type === filterType;
+                const queryMatches = !normalizedQuery || getCardSearchText(card).includes(normalizedQuery);
+                const shouldShow = categoryMatches && queryMatches;
+
+                card.style.display = shouldShow ? '' : 'none';
+                setCardTitleHighlight(card, shouldShow ? normalizedQuery : '');
+
+                if (shouldShow) {
+                    visibleCards.push(card);
+                    if (card.dataset.type === 'main' && card.dataset.source === 'directory') {
+                        visibleDirectoryMainCards.push(card);
+                    }
+                }
+            });
+
+            if (filterType === 'main') {
+                refreshMainPagination(visibleDirectoryMainCards);
+            } else {
+                visibleMainCards = [];
+                if (workPagination) workPagination.hidden = true;
+            }
+
+            updateWorksSearchStatus(visibleCards.length, cards.length);
+            toggleMainMobileScrollLayout();
+        }
+
+        function filterWorks(type: string, button: HTMLElement | null) {
+            const buttons = document.querySelectorAll<HTMLElement>('.filter-btn');
+            currentFilter = type;
+
+            buttons.forEach(btn => btn.classList.remove('active'));
+            if (button) {
+                button.classList.add('active');
+            }
+
+            applyWorksFilterState();
+        }
+
+        paginationPrevBtn?.addEventListener('click', () => {
+            renderMainPage(currentMainPage - 1, true);
+        });
+
+        paginationNextBtn?.addEventListener('click', () => {
+            renderMainPage(currentMainPage + 1, true);
+        });
+
+        window.addEventListener('resize', () => {
+            toggleMainMobileScrollLayout();
+
+            if (currentFilter === 'main' || currentSearchQuery) {
+                applyWorksFilterState();
+            }
+        });
+
+        document.querySelectorAll<HTMLElement>('.filter-btn').forEach(button => {
+            button.addEventListener('click', () => {
+                const hasActiveSearchQuery = normalizeSearchText(currentSearchQuery).length > 0;
+                if (hasActiveSearchQuery && worksSearchInput) {
+                    worksSearchInput.value = '';
+                    currentSearchQuery = '';
+                }
+
+                filterWorks(button.dataset.filter || 'all', button);
+                // Add glow effect
+                button.classList.add('glow-active');
+                setTimeout(() => button.classList.remove('glow-active'), 800);
+            });
+        });
+
+        function handleWorksSearchUpdate() {
+            if (!worksSearchInput) return;
+
+            currentSearchQuery = worksSearchInput.value;
+
+            applyWorksFilterState();
+        }
+
+        worksSearchInput?.addEventListener('input', handleWorksSearchUpdate);
+        worksSearchInput?.addEventListener('keyup', handleWorksSearchUpdate);
+        worksSearchInput?.addEventListener('search', handleWorksSearchUpdate);
+        worksSearchInput?.addEventListener('change', handleWorksSearchUpdate);
+
+        worksSearchClear?.addEventListener('click', () => {
+            if (worksSearchInput) {
+                worksSearchInput.value = '';
+                worksSearchInput.focus();
+            }
+            currentSearchQuery = '';
+
+            if (currentFilter === 'waterfall') {
+                const waterfallButton = document.querySelector<HTMLElement>('.filter-btn[data-filter="waterfall"]');
+                filterWorks('waterfall', waterfallButton);
+                return;
+            }
+
+            applyWorksFilterState();
+        });
+
+        document.querySelectorAll<HTMLElement>('.works-hotkey').forEach((button) => {
+            button.addEventListener('click', () => {
+                const keyword = button.dataset.searchKeyword || '';
+                if (!worksSearchInput) return;
+
+                worksSearchInput.value = keyword;
+                currentSearchQuery = keyword;
+
+                applyWorksFilterState();
+            });
+        });
+
+        document.addEventListener('keydown', (event) => {
+            const isSearchShortcut = event.key === '/' || ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k');
+
+            if (isSearchShortcut && document.activeElement !== worksSearchInput) {
+                event.preventDefault();
+                worksSearchInput?.focus();
+                worksSearchInput?.select();
+                return;
+            }
+
+            if (event.key === 'Escape' && document.activeElement === worksSearchInput) {
+                worksSearchClear?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            }
+        });
+
+        const defaultFilterBtn = document.querySelector<HTMLElement>('.filter-btn.active');
+        if (defaultFilterBtn) {
+            filterWorks(defaultFilterBtn.dataset.filter || 'all', defaultFilterBtn);
+        }
+
+        const chartPreview = document.getElementById('chartPreview');
+        const overlay = document.getElementById('lightboxOverlay');
+        const lightboxGallery = document.getElementById('lightboxGallery');
+        const lightboxCaption = document.getElementById('lightboxCaption');
+        const lightboxClose = document.getElementById('lightboxClose');
+        const lightboxPrev = document.getElementById('lightboxPrev');
+        const lightboxNext = document.getElementById('lightboxNext');
+        const methodChart = document.getElementById('methodChart');
+        type LightboxMediaItem = {
+            type: 'image' | 'video';
+            src: string;
+        };
+
+        let currentLightboxMedia: LightboxMediaItem[] = [];
+        let currentLightboxIndex = 0;
+        let previousBodyOverflow = '';
+
+        function getMediaMimeType(src: string) {
+            const cleanSrc = src.split('?')[0].toLowerCase();
+            if (cleanSrc.endsWith('.webm')) return 'video/webm';
+            if (cleanSrc.endsWith('.mov')) return 'video/quicktime';
+            return 'video/mp4';
+        }
+
+        function syncLightboxVideoPlayback() {
+            if (!lightboxGallery || !currentLightboxMedia.length) return;
+
+            const mediaNodes = lightboxGallery.querySelectorAll<HTMLElement>('[data-lightbox-item]');
+            mediaNodes.forEach((node, nodeIndex) => {
+                if (!(node instanceof HTMLVideoElement)) return;
+
+                if (nodeIndex !== currentLightboxIndex) {
+                    node.pause();
+                    return;
+                }
+
+                node.defaultMuted = true;
+                node.muted = true;
+                node.playsInline = true;
+                node.load();
+                node.play().catch(() => {
+                    // User can still press the play button in controls if autoplay is blocked.
+                });
+            });
+        }
+
+        function openLightbox(media: LightboxMediaItem[], index = 0) {
+            if (!overlay || !lightboxGallery || !lightboxCaption) return;
+            currentLightboxMedia = media;
+            currentLightboxIndex = index;
+            lightboxGallery.innerHTML = media.map((item, mediaIndex) => `
+                <div class="lightbox-media-frame">
+                    ${item.type === 'video'
+                        ? `<video data-lightbox-item controls controlslist="nodownload noplaybackrate noremoteplayback nofullscreen" disablepictureinpicture disableremoteplayback autoplay loop muted playsinline preload="metadata"><source src="${item.src}" type="${getMediaMimeType(item.src)}" /></video>`
+                        : `<img data-lightbox-item ${getResponsiveImageTagAttributes(item.src, '100vw')} alt="作品图 ${mediaIndex + 1}">`
+                    }
+                </div>
+            `).join('');
+            const scrollArea = lightboxGallery.parentElement as HTMLElement | null;
+            lightboxCaption.textContent = media.length > 1 ? `共 ${media.length} 项，向下滚动查看` : (media[0]?.type === 'video' ? '作品视频' : '作品大图');
+            overlay.classList.add('active');
+            previousBodyOverflow = document.body.style.overflow;
+            document.body.style.overflow = 'hidden';
+            requestAnimationFrame(() => {
+                const targetMedia = lightboxGallery.querySelectorAll<HTMLElement>('[data-lightbox-item]')[currentLightboxIndex];
+                const scrollArea = lightboxGallery.parentElement as HTMLElement | null;
+                if (targetMedia && scrollArea) {
+                    const topOffset = targetMedia.offsetTop;
+                    scrollArea.scrollTo({ top: topOffset, behavior: 'auto' });
+                }
+                syncLightboxVideoPlayback();
+            });
+        }
+
+        function openLightboxImages(images: string[], index = 0) {
+            openLightbox(images.map((src) => ({ type: 'image', src })), index);
+        }
+
+        function closeLightbox() {
+            if (overlay) overlay.classList.remove('active');
+            lightboxGallery?.querySelectorAll('video').forEach((video) => {
+                if (video instanceof HTMLVideoElement) {
+                    video.pause();
+                }
+            });
+            document.body.style.overflow = previousBodyOverflow;
+        }
+
+        function openMethodologyLightbox() {
+            const imageSrc = methodChart?.getAttribute('data-image') || '/1shouye/2suo.png';
+            if (
+                overlay?.classList.contains('active') &&
+                currentLightboxMedia.length === 1 &&
+                currentLightboxMedia[0].type === 'image' &&
+                currentLightboxMedia[0].src === imageSrc
+            ) {
+                closeLightbox();
+                return;
+            }
+            openLightboxImages([imageSrc], 0);
+        }
+
+        function showLightboxImage(index: number) {
+            if (!lightboxGallery || !lightboxCaption || !currentLightboxMedia.length) return;
+            currentLightboxIndex = (index + currentLightboxMedia.length) % currentLightboxMedia.length;
+            const targetMedia = lightboxGallery.querySelectorAll<HTMLElement>('[data-lightbox-item]')[currentLightboxIndex];
+            const scrollArea = lightboxGallery.parentElement as HTMLElement | null;
+            if (targetMedia && scrollArea) {
+                const topOffset = targetMedia.offsetTop;
+                scrollArea.scrollTo({ top: topOffset, behavior: 'smooth' });
+            }
+            if (currentLightboxMedia.length > 1) {
+                lightboxCaption.textContent = `作品 ${currentLightboxIndex + 1}/${currentLightboxMedia.length}`;
+            } else {
+                lightboxCaption.textContent = currentLightboxMedia[0].type === 'video' ? '作品视频' : '作品大图';
+            }
+            syncLightboxVideoPlayback();
+        }
+
+        function getProjectLightboxMedia(card: HTMLElement): LightboxMediaItem[] {
+            const baseImages = [
+                'https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=600&q=80',
+                'https://images.unsplash.com/photo-1516321497487-e288fb19713f?auto=format&fit=crop&w=600&q=80',
+                'https://images.unsplash.com/photo-1495707902641-75cac588d2e9?auto=format&fit=crop&w=600&q=80',
+                'https://images.unsplash.com/photo-1517841905240-472988babdf9?auto=format&fit=crop&w=600&q=80'
+            ];
+            const customImages = JSON.parse(card.dataset.images || '[]') as string[];
+            const customVideos = JSON.parse(card.dataset.videos || '[]') as string[];
+            const isDirectoryCard = card.dataset.source === 'directory';
+            if (isDirectoryCard && !customImages.length && !customVideos.length) {
+                return [];
+            }
+
+            const media: LightboxMediaItem[] = [];
+            if (customVideos.length) {
+                media.push(...customVideos.map((src) => ({ type: 'video' as const, src })));
+            }
+            if (customImages.length) {
+                media.push(...customImages.map((src) => ({ type: 'image' as const, src })));
+            }
+            if (media.length) {
+                return media;
+            }
+
+            const sourceImages = customImages.length ? customImages : baseImages;
+            return Array.from({ length: sourceImages.length }, (_, index) => ({ type: 'image' as const, src: sourceImages[index] }));
+        }
+
+        document.querySelectorAll<HTMLElement>('.project-card').forEach(card => {
+            card.addEventListener('click', () => {
+                const media = getProjectLightboxMedia(card);
+                if (media.length) {
+                    openLightbox(media, 0);
+                }
+            });
+        });
+
+        document.querySelectorAll<HTMLVideoElement>('.project-preview-video, .waterfall-preview-video').forEach(video => {
+            const thumb = video.closest<HTMLElement>('.project-thumb');
+            const waterfallBlock = video.closest<HTMLElement>('.waterfall-block');
+            const mediaWrap = thumb || waterfallBlock;
+            if (!mediaWrap) return;
+
+            const showFallback = () => {
+                mediaWrap.classList.add('video-error');
+            };
+
+            const hideFallback = () => {
+                mediaWrap.classList.remove('video-error');
+            };
+
+            const tryPlayPreview = () => {
+                video.play().then(() => {
+                }).catch(() => {
+                    // Keep cover visible if autoplay is blocked or decode failed.
+                    showFallback();
+                });
+            };
+
+            video.defaultMuted = true;
+            video.muted = true;
+            video.autoplay = true;
+            video.loop = true;
+            video.playsInline = true;
+            video.setAttribute('muted', '');
+            video.setAttribute('autoplay', '');
+            video.setAttribute('playsinline', '');
+            video.setAttribute('webkit-playsinline', 'true');
+
+            // Start from image fallback and only hide it after video is really playing.
+            showFallback();
+
+            if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+                tryPlayPreview();
+            }
+
+            video.addEventListener('loadeddata', tryPlayPreview);
+            video.addEventListener('loadedmetadata', tryPlayPreview);
+            video.addEventListener('canplay', () => {
+                tryPlayPreview();
+            });
+            video.addEventListener('playing', hideFallback);
+            video.addEventListener('error', showFallback);
+            video.addEventListener('abort', showFallback);
+            video.addEventListener('stalled', showFallback);
+            video.addEventListener('emptied', showFallback);
+            video.addEventListener('suspend', () => {
+                if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+                    tryPlayPreview();
+                } else {
+                    showFallback();
+                }
+            });
+
+            const visibilityObserver = new IntersectionObserver((entries) => {
+                entries.forEach((entry) => {
+                    if (!entry.isIntersecting) {
+                        video.pause();
+                        return;
+                    }
+
+                    tryPlayPreview();
+                });
+            }, { threshold: 0.35 });
+
+            visibilityObserver.observe(video);
+        });
+
+        document.querySelectorAll<HTMLElement>('.rank-item').forEach(item => {
+            item.addEventListener('click', () => {
+                const isExpanded = item.classList.contains('expanded');
+                document.querySelectorAll<HTMLElement>('.rank-item').forEach(otherItem => {
+                    otherItem.classList.remove('expanded');
+                    const gallery = otherItem.querySelector<HTMLElement>('.rank-gallery');
+                    if (gallery) gallery.innerHTML = '';
+                });
+
+                if (!isExpanded) {
+                    item.classList.add('expanded');
+                    const images = JSON.parse(item.dataset.images || '[]') as string[];
+                    const gallery = item.querySelector<HTMLElement>('.rank-gallery');
+                    if (gallery && images.length) {
+                        const displayImages = Array.from({ length: 25 }, (_, index: number) => {
+                            const src = images[index % images.length];
+                            if (/^https?:\/\/images\.unsplash\.com\//i.test(src)) {
+                                return `${src}${src.includes('?') ? '&' : '?'}sig=${index}`;
+                            }
+                            return src;
+                        });
+                        gallery.innerHTML = displayImages.slice(0, 10).map((src, index: number) => {
+                            if (index === 9) {
+                                return `<div class="gallery-more">+${displayImages.length - 9} 张</div>`;
+                            }
+                            return `<img ${getResponsiveImageTagAttributes(src, '50vw')} alt="爆款案例图片" data-index="${index}">`;
+                        }).join('');
+                        gallery.querySelectorAll<HTMLImageElement>('img').forEach((img, index) => {
+                            img.addEventListener('click', (event) => {
+                                event.stopPropagation();
+                                openLightboxImages(displayImages, index);
+                            });
+                        });
+                    }
+                }
+            });
+        });
+
+        if (chartPreview) {
+            chartPreview.addEventListener('click', () => {
+                const imageSrc = chartPreview.getAttribute('data-image') || '/1shouye/ms.png';
+                openLightboxImages([imageSrc], 0);
+            });
+        }
+
+        methodChart?.addEventListener('click', openMethodologyLightbox);
+
+        lightboxGallery?.addEventListener('click', (event) => {
+            const target = event.target;
+            if (target instanceof HTMLImageElement && currentLightboxMedia.length === 1) {
+                closeLightbox();
+            }
+        });
+
+        if (overlay) {
+            overlay.addEventListener('click', (event) => {
+                if (event.target === overlay) closeLightbox();
+            });
+        }
+        if (lightboxClose) lightboxClose.addEventListener('click', closeLightbox);
+        if (lightboxPrev) lightboxPrev.addEventListener('click', () => showLightboxImage(currentLightboxIndex - 1));
+        if (lightboxNext) lightboxNext.addEventListener('click', () => showLightboxImage(currentLightboxIndex + 1));
+        document.addEventListener('keydown', (event) => {
+            if (!overlay?.classList.contains('active')) return;
+            if (event.key === 'Escape') closeLightbox();
+            if (event.key === 'ArrowRight') showLightboxImage(currentLightboxIndex + 1);
+            if (event.key === 'ArrowLeft') showLightboxImage(currentLightboxIndex - 1);
+        });
+
+        // === 原生 JS 数字滚动动画 ===
+        function animateCountUp(el: HTMLElement) {
+            const target = parseInt(el.dataset.target || '0');
+            const suffix = el.dataset.suffix || '';
+            const duration = 2000; // 2秒动画
+            const step = target / (duration / 16); // 每帧增加的数值
+            let current = 0;
+
+            const timer = setInterval(() => {
+                current += step;
+                if (current >= target) {
+                    el.innerText = target + suffix;
+                    clearInterval(timer);
+                } else {
+                    el.innerText = Math.ceil(current) + suffix;
+                }
+            }, 16);
+        }
+
+        // === 监听滚动触发数字动画 ===
+        const observer = new IntersectionObserver((entries) => {
+            entries.forEach(entry => {
+                if (entry.isIntersecting && entry.target instanceof HTMLElement) {
+                    animateCountUp(entry.target);
+                    observer.unobserve(entry.target);
+                }
+            });
+        }, { threshold: 0.5 });
+
+        document.querySelectorAll('.count-up').forEach(el => observer.observe(el));
+
+        // === 编辑模式开关 ===
+        let clickCount = 0;
+        let clickTimer: ReturnType<typeof setTimeout> | null = null;
+        const logo = document.getElementById('logo-trigger');
+        const indicator = document.getElementById('edit-mode-indicator');
+
+        if (logo) {
+            logo.addEventListener('click', () => {
+                clickCount++;
+                if (clickCount === 1) {
+                    clickTimer = setTimeout(() => {
+                        clickCount = 0;
+                    }, 1000); // 1秒内点击3次
+                } else if (clickCount === 3) {
+                    if (clickTimer) clearTimeout(clickTimer);
+                    clickCount = 0;
+                    
+                    const isEditable = document.body.contentEditable === 'true';
+                    document.body.contentEditable = isEditable ? 'false' : 'true';
+                    
+                    if (indicator) {
+                        indicator.style.display = isEditable ? 'none' : 'block';
+                        setTimeout(() => {
+                            if (!isEditable && indicator) indicator.style.display = 'none';
+                        }, 2000);
+                    }
+                }
+            });
+        }
+
+        // === 移动端导航 开关 ===
+        const mobileToggle = document.getElementById('mobile-nav-toggle');
+        const mobileNav = document.getElementById('mobileNav');
+        const mobileCloseBtn = document.getElementById('mobileNavClose');
+        function openMobileNav() {
+            if (mobileNav) {
+                mobileNav.classList.add('open');
+                mobileNav.setAttribute('aria-hidden', 'false');
+                document.body.style.overflow = 'hidden';
+            }
+        }
+        function closeMobileNav() {
+            if (mobileNav) {
+                mobileNav.classList.remove('open');
+                mobileNav.setAttribute('aria-hidden', 'true');
+                document.body.style.overflow = '';
+            }
+        }
+        mobileToggle?.addEventListener('click', openMobileNav);
+        mobileCloseBtn?.addEventListener('click', closeMobileNav);
+        document.querySelectorAll('.mobile-nav a').forEach(a => a.addEventListener('click', closeMobileNav));
+        document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeMobileNav(); });
+        // contact avatar replace & copy email/wechat
+        const contactAvatar = document.getElementById('contactAvatar') as HTMLImageElement | null;
+        const copyEmailBtn = document.getElementById('copyEmail');
+        const copyWeChatBtn = document.getElementById('copyWeChat');
+        // load saved avatar
+        try {
+            const saved = localStorage.getItem('contactAvatarSrc');
+            if (saved && contactAvatar) contactAvatar.src = saved;
+        } catch (e) { }
+        copyEmailBtn?.addEventListener('click', (e) => {
+            e.preventDefault();
+            // Add glow effect
+            (e.target as HTMLElement).classList.add('glow-active');
+            setTimeout(() => (e.target as HTMLElement).classList.remove('glow-active'), 800);
+            
+            const text = '312675265@qq.com';
+            if (navigator.clipboard) {
+                navigator.clipboard.writeText(text).then(() => alert('Email 已复制：' + text));
+            } else {
+                const input = document.createElement('input');
+                input.value = text;
+                document.body.appendChild(input);
+                input.select();
+                document.execCommand('copy');
+                document.body.removeChild(input);
+                alert('Email 已复制：' + text);
+            }
+        });
+
+        copyWeChatBtn?.addEventListener('click', (e) => {
+            e.preventDefault();
+            // Add glow effect
+            (e.target as HTMLElement).classList.add('glow-active');
+            setTimeout(() => (e.target as HTMLElement).classList.remove('glow-active'), 800);
+            
+            const text = 'YIYUANYUYU';
+            if (navigator.clipboard) {
+                navigator.clipboard.writeText(text).then(() => alert('WeChat 已复制：' + text));
+            } else {
+                alert('请手动复制：' + text);
+            }
+        });
+
+        // Add glow effect to all .btn buttons
+        document.querySelectorAll<HTMLElement>('.btn').forEach(button => {
+            button.addEventListener('click', (e) => {
+                button.classList.add('glow-active');
+                setTimeout(() => button.classList.remove('glow-active'), 800);
+            });
+        });
+
+        // Add glow effect to other buttons on interaction
+        document.addEventListener('click', (e) => {
+            const target = (e.target as HTMLElement).closest('a, button');
+            if (!target) return;
+            if (target.classList.contains('glow-active')) return;
+            
+            // Only apply to specific button classes
+            if (!target.classList.contains('filter-btn') && 
+                !target.id?.includes('copy') && 
+                !target.classList.contains('btn')) {
+                // Add glow to any other interactive elements if needed
+            }
+        }, true);
+
+        // Media protection: reduce direct save/download entry points on both mobile and desktop.
+        document.body.classList.add('media-protect');
+
+        document.querySelectorAll<HTMLImageElement | HTMLVideoElement>('img, video').forEach((mediaEl) => {
+            mediaEl.setAttribute('draggable', 'false');
+            if (mediaEl instanceof HTMLVideoElement) {
+                mediaEl.setAttribute('controlsList', 'nodownload noplaybackrate noremoteplayback nofullscreen');
+                mediaEl.setAttribute('disablepictureinpicture', '');
+                mediaEl.setAttribute('disableremoteplayback', '');
+                mediaEl.disablePictureInPicture = true;
+            }
+        });
+
+        document.addEventListener('contextmenu', (event) => {
+            const target = event.target as HTMLElement | null;
+            if (!target) return;
+            if (target.closest('input, textarea')) return;
+            if (target.closest('img, video, .project-card, .waterfall-item, .lightbox-overlay')) {
+                event.preventDefault();
+            }
+        });
+
+        document.addEventListener('dragstart', (event) => {
+            const target = event.target as HTMLElement | null;
+            if (!target) return;
+            if (target.closest('img, video')) {
+                event.preventDefault();
+            }
+        });
+
+        document.addEventListener('selectstart', (event) => {
+            const target = event.target as HTMLElement | null;
+            if (!target) return;
+            if (target.closest('img, video')) {
+                event.preventDefault();
+            }
+        });
+
+        let bounceLocked = false;
+        let lastBounceAt = 0;
+        let touchStartY = 0;
+        let touchStartScrollY = 0;
+        let touchStartAtTop = false;
+        let touchStartAtBottom = false;
+        let touchBounceTriggered = false;
+
+        function canUseGlobalEdgeBounce(target: EventTarget | null) {
+            if (!(target instanceof Element)) return true;
+            if (target.closest('.lightbox-scroll-area, .mobile-nav.open')) return false;
+
+            let current: Element | null = target;
+            while (current && current !== document.body) {
+                const style = window.getComputedStyle(current);
+                const overflowY = style.overflowY;
+                const isScrollableY = (overflowY === 'auto' || overflowY === 'scroll')
+                    && (current as HTMLElement).scrollHeight > (current as HTMLElement).clientHeight;
+
+                if (isScrollableY) {
+                    return false;
+                }
+
+                current = current.parentElement;
+            }
+
+            return true;
+        }
+
+        function isAtTopEdge() {
+            return window.scrollY <= 0;
+        }
+
+        function isAtBottomEdge() {
+            const doc = document.documentElement;
+            return Math.ceil(window.scrollY + window.innerHeight) >= doc.scrollHeight;
+        }
+
+        function triggerEdgeBounce(source: 'wheel' | 'touch') {
+            const now = Date.now();
+            const cooldown = source === 'touch' ? 680 : 320;
+            if (now - lastBounceAt < cooldown) return;
+            if (bounceLocked) return;
+
+            lastBounceAt = now;
+            bounceLocked = true;
+            document.body.classList.remove('edge-bounce-top');
+            document.body.classList.add('edge-bounce-top');
+            window.setTimeout(() => {
+                document.body.classList.remove('edge-bounce-top');
+                bounceLocked = false;
+            }, 300);
+        }
+
+        window.addEventListener('wheel', (event) => {
+            if (!canUseGlobalEdgeBounce(event.target)) return;
+
+            if (event.deltaY < -8 && isAtTopEdge()) {
+                event.preventDefault();
+                triggerEdgeBounce('wheel');
+            }
+        }, { passive: false });
+
+        window.addEventListener('touchstart', (event) => {
+            touchStartY = event.touches[0]?.clientY ?? 0;
+            touchStartScrollY = window.scrollY;
+            touchBounceTriggered = false;
+
+            if (!canUseGlobalEdgeBounce(event.target)) {
+                touchStartAtTop = false;
+                touchStartAtBottom = false;
+                return;
+            }
+
+            touchStartAtTop = isAtTopEdge();
+            touchStartAtBottom = isAtBottomEdge();
+        }, { passive: true });
+
+        window.addEventListener('touchmove', (event) => {
+            if (!canUseGlobalEdgeBounce(event.target)) return;
+            if (touchBounceTriggered) return;
+
+            const currentY = event.touches[0]?.clientY ?? 0;
+            const deltaY = currentY - touchStartY;
+            const deltaAbs = Math.abs(deltaY);
+            const stillNearStart = Math.abs(window.scrollY - touchStartScrollY) <= 2;
+
+            if (!stillNearStart || deltaAbs < 24 || deltaAbs > 120) {
+                return;
+            }
+
+            if (deltaY > 16 && touchStartAtTop) {
+                triggerEdgeBounce('touch');
+                touchBounceTriggered = true;
+                return;
+            }
+        }, { passive: false });
+
+        window.addEventListener('touchend', () => {
+            touchBounceTriggered = false;
+        }, { passive: true });
+
+        const homeSection = document.getElementById('home');
+        const orientationWindow = window as unknown as Window & {
+            DeviceOrientationEvent?: typeof DeviceOrientationEvent & {
+                requestPermission?: () => Promise<'granted' | 'denied'>;
+            };
+        };
+        const isIOSDevice = /iPad|iPhone|iPod/i.test(navigator.userAgent);
+        let orientationEnabled = false;
+
+        function applyHeroTilt(gamma: number, beta: number) {
+            if (!homeSection) return;
+            const maxShift = isMobileViewport() ? 28 : 14;
+            const x = Math.max(-1, Math.min(1, gamma / 30)) * maxShift;
+            const y = Math.max(-1, Math.min(1, beta / 45)) * maxShift;
+            homeSection.style.setProperty('--hero-shift-x', `${x.toFixed(2)}px`);
+            homeSection.style.setProperty('--hero-shift-y', `${(-y).toFixed(2)}px`);
+        }
+
+        function startIOSHeroAutoDrift() {
+            if (!homeSection) return;
+            if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+
+            const startTime = performance.now();
+            const duration = 5200;
+            const amplitude = 20;
+
+            const tick = (now: number) => {
+                const phase = ((now - startTime) % duration) / duration;
+                const x = Math.sin(phase * Math.PI * 2) * amplitude;
+                homeSection.style.setProperty('--hero-shift-x', `${x.toFixed(2)}px`);
+                homeSection.style.setProperty('--hero-shift-y', '0px');
+                window.requestAnimationFrame(tick);
+            };
+
+            window.requestAnimationFrame(tick);
+        }
+
+        function bindOrientationListener() {
+            if (orientationEnabled) return;
+            orientationEnabled = true;
+            window.addEventListener('deviceorientation', (event) => {
+                if (typeof event.gamma !== 'number' || typeof event.beta !== 'number') return;
+                applyHeroTilt(event.gamma, event.beta);
+            }, { passive: true });
+        }
+
+        if (isIOSDevice && homeSection) {
+            startIOSHeroAutoDrift();
+        }
+
+        if (!isIOSDevice && homeSection && orientationWindow.DeviceOrientationEvent) {
+            if (typeof orientationWindow.DeviceOrientationEvent.requestPermission === 'function') {
+                const requestMotionPermission = () => {
+                    orientationWindow.DeviceOrientationEvent?.requestPermission?.()
+                        .then((state) => {
+                            if (state === 'granted') {
+                                bindOrientationListener();
+                            }
+                        })
+                        .catch(() => {
+                            // User may deny motion permission.
+                        });
+                };
+
+                homeSection.addEventListener('click', requestMotionPermission, { once: true });
+                homeSection.addEventListener('touchstart', requestMotionPermission, { once: true, passive: true });
+            } else {
+                bindOrientationListener();
+            }
+        }
+    </script>
+</body>
+</html>
