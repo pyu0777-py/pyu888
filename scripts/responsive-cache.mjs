@@ -7,7 +7,8 @@ const publicRoot = path.join(projectRoot, 'public');
 const responsiveRoot = path.join(publicRoot, '__responsive');
 
 const imageExtensions = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.avif']);
-const responsiveVariantWidths = [240, 360, 480, 640, 960, 1280];
+const maxResponsiveWidth = 1450;
+const responsiveVariantWidths = [240, 360, 480, 640, 960, 1280, maxResponsiveWidth];
 
 function getSharpFormat(extension) {
   const normalized = extension.toLowerCase();

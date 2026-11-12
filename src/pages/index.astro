@@ -41,7 +41,8 @@ const waterfallRoot = path.join(publicRoot, '2c', '1p');
 const responsiveOutputRoot = path.join(publicRoot, '__responsive');
 const imageExtensions = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.avif']);
 const videoExtensions = new Set(['.mp4', '.webm', '.mov']);
-const responsiveVariantWidths = [240, 360, 480, 640, 960, 1280];
+const maxResponsiveWidth = 1450;
+const responsiveVariantWidths = [240, 360, 480, 640, 960, 1280, maxResponsiveWidth];
 const responsiveImageCache = new Map<string, Promise<ResponsiveImageData>>();
 const isDev = import.meta.env.DEV;
 
