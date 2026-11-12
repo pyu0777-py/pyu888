@@ -1,5 +1,7 @@
 # build output
 dist/
+# original media assets are intentionally kept local to avoid Git size limits
+public/
 public/__responsive/
 # generated types
 .astro/
