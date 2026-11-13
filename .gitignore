@@ -3,6 +3,7 @@ dist/
 .astro/
 node_modules/
 .vscode/
+public/__responsive/
 
 # logs
 npm-debug.log*
@@ -19,6 +20,4 @@ pnpm-debug.log*
 
 # jetbrains setting folder
 .idea/
-
-public/
 
